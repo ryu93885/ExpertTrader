@@ -25,11 +25,13 @@ SRC="$1"
 ZIP_PATH="training_data.zip"
 
 echo "=== gdownのインストール ==="
-pip install --quiet gdown
+pip install --quiet --upgrade gdown
 
 echo ""
 echo "=== Google Driveからダウンロード中 ==="
-gdown --fuzzy "$SRC" -O "$ZIP_PATH"
+# 💡 修正: gdownの新しいバージョン(6.x系)では --fuzzy オプションが廃止され、
+# URLからのID自動抽出が標準動作になっているため、フラグを付けずに呼び出す。
+gdown "$SRC" -O "$ZIP_PATH"
 
 echo ""
 echo "=== リポジトリ直下に展開中 ==="

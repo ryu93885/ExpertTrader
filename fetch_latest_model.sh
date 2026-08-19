@@ -29,10 +29,12 @@ if [ -f "$DEST" ]; then
   echo "=== 既存モデルを退避: $DEST -> $BACKUP ==="
 fi
 
-pip install --quiet gdown
+pip install --quiet --upgrade gdown
 
 echo "=== Google Driveから最新モデルをダウンロード中 ==="
-gdown --fuzzy "$SRC" -O "$DEST"
+# 💡 修正: gdownの新しいバージョン(6.x系)では --fuzzy オプションが廃止され、
+# URLからのID自動抽出が標準動作になっているため、フラグを付けずに呼び出す。
+gdown "$SRC" -O "$DEST"
 
 echo ""
 echo "=== 完了 ==="
