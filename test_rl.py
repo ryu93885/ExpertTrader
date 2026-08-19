@@ -1,5 +1,6 @@
 import torch
 import os
+import json
 import logging
 import argparse
 import pandas as pd
@@ -74,7 +75,22 @@ def main():
         pytorch_model.load_state_dict(checkpoint)
     #テスト時は推論モードへ
     pytorch_model.eval()
-    
+
+    # 💡 train.py が保存した risk スケーラー（Zスコア化に使ったmean/std）をロードする。
+    # evaluate.py / predict.py と同じ規約でモデルのrisk出力を逆変換するために FXTradingEnv へ渡す。
+    risk_scaler_path = os.path.join(DRIVE_BASE, "saved_models", f"risk_scalers_{mode}.json")
+    symbol_risk_scaler = None
+    if os.path.exists(risk_scaler_path):
+        with open(risk_scaler_path, "r", encoding="utf-8") as f:
+            risk_scalers = json.load(f)
+        symbol_risk_scaler = risk_scalers.get(symbol)
+        if symbol_risk_scaler:
+            logging.info(f"✅ リスクスケーラーをロードしました: {symbol} (mean={symbol_risk_scaler['mean']:.4f}, std={symbol_risk_scaler['std']:.4f})")
+        else:
+            logging.warning(f"⚠️ {risk_scaler_path} に {symbol} のスケーラーが見つかりません。無変換(mean=0,std=1)で進みます。")
+    else:
+        logging.warning(f"⚠️ リスクスケーラーが見つかりません: {risk_scaler_path}。無変換(mean=0,std=1)で進みます。")
+
     if symbol == "GOLD":
         env_tx_cost = 0.4        # GOLDの想定スプレッド (例: 4.0 pips)
         env_contract = 100       # 1ロット = 100オンス
@@ -98,7 +114,8 @@ def main():
         contract_size=env_contract,
         exchange_rate=env_exchange,
         max_steps=len(dataset)-1,
-        initial_balance=env_init_balance
+        initial_balance=env_init_balance,
+        risk_scaler=symbol_risk_scaler
     )
     env = DummyVecEnv([lambda:raw_env])
 

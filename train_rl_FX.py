@@ -1,5 +1,6 @@
 import torch
 import os
+import json
 import logging
 import argparse
 import pandas as pd
@@ -90,15 +91,33 @@ def main():
         logging.error(f"❌ PyTorchモデルが見つかりません: {model_path}")
         return
 
+    # 💡 train_FX.py が保存した risk スケーラー（Zスコア化に使ったmean/std）をロードする。
+    # evaluate.py / predict.py と同じ規約でモデルのrisk出力を逆変換するために FXTradingEnv へ渡す。
+    # ⚠️ train.py / train_FX.py は現状どちらも同じ "risk_scalers_{mode}.json" に保存するため、
+    #    直近に実行した方の値で上書きされている点に注意（別ファイルへの分離は別途対応が必要）。
+    risk_scaler_path = os.path.join(DRIVE_BASE, "saved_models", f"risk_scalers_{mode}.json")
+    symbol_risk_scaler = None
+    if os.path.exists(risk_scaler_path):
+        with open(risk_scaler_path, "r", encoding="utf-8") as f:
+            risk_scalers = json.load(f)
+        symbol_risk_scaler = risk_scalers.get(symbol)
+        if symbol_risk_scaler:
+            logging.info(f"✅ リスクスケーラーをロードしました: {symbol} (mean={symbol_risk_scaler['mean']:.4f}, std={symbol_risk_scaler['std']:.4f})")
+        else:
+            logging.warning(f"⚠️ {risk_scaler_path} に {symbol} のスケーラーが見つかりません。無変換(mean=0,std=1)で進みます。")
+    else:
+        logging.warning(f"⚠️ リスクスケーラーが見つかりません: {risk_scaler_path}。無変換(mean=0,std=1)で進みます。")
+
     # ==========================================
     # 3. Gym環境の構築 (ハイブリッド仕様)
     # ==========================================
     raw_env = FXTradingEnv(
-        dataset=dataset, 
+        dataset=dataset,
         trained_model=pytorch_model,
         price_col=price_col,
         raw_features=target_features,
-        raw_data_df=raw_df
+        raw_data_df=raw_df,
+        risk_scaler=symbol_risk_scaler
     )
 
     check_env(raw_env)

@@ -11,7 +11,7 @@ class FXTradingEnv(gym.Env):
     ※TP/SLアクション学習、利確ボーナス、保有時間ペナルティ実装版
     ※コントラクトサイズ・為替レート（クロス円等）対応版
     """
-    def __init__(self, dataset, trained_model, initial_balance=1000000, max_lot_size=1.0, transaction_cost=0.0001, price_col="M15_close", raw_features=None, raw_data_df=None, max_steps=1000, contract_size=100000, exchange_rate=1.0):
+    def __init__(self, dataset, trained_model, initial_balance=1000000, max_lot_size=1.0, transaction_cost=0.0001, price_col="M15_close", raw_features=None, raw_data_df=None, max_steps=1000, contract_size=100000, exchange_rate=1.0, risk_scaler=None):
         super(FXTradingEnv, self).__init__()
         logging.info("fx_env:ver204.1")
         self.dataset = dataset
@@ -19,7 +19,14 @@ class FXTradingEnv(gym.Env):
         self.raw_data = raw_data_df
         self.model.eval()
         self.device = next(self.model.parameters()).device
-        
+
+        # train.py が保存する risk_scalers_{mode}.json (symbol毎の mean/std) を受け取り、
+        # モデルの生出力（Zスコア）を実際の target_risk_pct スケールへ逆変換するために使う。
+        # evaluate.py / predict.py と同じ逆変換規約に揃える（未指定時は無変換=mean0/std1）。
+        risk_scaler = risk_scaler or {}
+        self.risk_mean = risk_scaler.get("mean", 0.0)
+        self.risk_std = risk_scaler.get("std", 1.0)
+
         self.initial_balance = initial_balance
         self.max_lot_size = max_lot_size
         self.transaction_cost = transaction_cost 
@@ -104,8 +111,12 @@ class FXTradingEnv(gym.Env):
         with torch.no_grad():
             class_out, risk_out = self.model(image_tensor, tabular_tensor)
             probs = torch.softmax(class_out, dim=1).cpu().numpy()[0]
-            risk_val = risk_out.cpu().numpy()[0][0]
-        
+            risk_val_scaled = risk_out.cpu().numpy()[0][0]
+
+        # train.py が学習時にZスコア化した target_risk_pct を、実際の%スケールへ逆変換する
+        # （evaluate.py / predict.py と同じ risk_val * std + mean の規約）。
+        risk_val = risk_val_scaled * self.risk_std + self.risk_mean
+
         self.current_risk_val = risk_val
 
         balance_ratio = self.balance / self.initial_balance

@@ -29,13 +29,22 @@ class PortfolioFXDataset(Dataset):
         self.feature_cols = {}
         for sym in self.symbols:
             exclude_exact = ["time", "future_close", "price_diff_pct", "target_class", "target_risk_pct"]
+            # merge_portfolio_data.py が付与する生値列（"_raw"）と、precompute_portfolio.py が
+            # 付与する事前推論列（prob_0/1/2, risk_val）は、モデル学習時の特徴量には含まれていない
+            # ため、_scaled.csv 由来の特徴量列とスケールが混在しないよう除外する。
+            exclude_suffixes_exact = ["prob_0", "prob_1", "prob_2", "risk_val"]
             cols = []
             for c in self.df.columns:
                 if c.startswith(f"{sym}_"):
                     # プレフィックス(例: "USDJPY_")を除去して完全一致判定を行う
                     base_col_name = c[len(f"{sym}_"):]
-                    if base_col_name not in exclude_exact:
-                        cols.append(c)
+                    if base_col_name in exclude_exact:
+                        continue
+                    if base_col_name.endswith("_raw"):
+                        continue
+                    if base_col_name in exclude_suffixes_exact:
+                        continue
+                    cols.append(c)
             self.feature_cols[sym] = cols
             
         # 画像読み込み用に、time列を文字列フォーマットに変換しておく
