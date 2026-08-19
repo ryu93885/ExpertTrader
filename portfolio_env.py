@@ -113,7 +113,7 @@ class PortfolioFXEnv(gym.Env):
             # 含み損益の計算と追加
             unrealized_pnl_ratio = 0.0
             if pos_size != 0:
-                current_price = row.get(f"{sym}_{base_tf}_close_row", self.entry_prices[sym])
+                current_price = row.get(f"{sym}_{base_tf}_close_raw", self.entry_prices[sym])
                 raw_pnl = (current_price - self.entry_prices[sym]) * pos_size * self.symbol_configs[sym]["contract_size"]
                 
                 # 円換算
