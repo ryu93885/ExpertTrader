@@ -143,7 +143,9 @@ class PortfolioFXEnv(gym.Env):
         row = self.dataset.df.iloc[self.current_step]
         base_tf = "M5" if self.dataset.mode == "short" else "M15" if self.dataset.mode == "medium" else "H4"
         tf = "M15" if self.dataset.mode == "short" else "H4" if self.dataset.mode == "medium" else "D1"
-        usdjpy_col = f"USDJPY_{base_tf}_close"
+        # 💡 修正: "_raw" が抜けており、標準化済み(Zスコア)の値を実勢レートとして
+        # 使ってしまっていた(_get_observation()側は元々 "_raw" 付きで正しい)。
+        usdjpy_col = f"USDJPY_{base_tf}_close_raw"
         if usdjpy_col in row.index:
             current_usdjpy_rate = row[usdjpy_col]
         else:
@@ -210,7 +212,7 @@ class PortfolioFXEnv(gym.Env):
                     elif sym in ["EURUSD", "GBPUSD", "AUDUSD", "GOLD"]: 
                         converted_pnl = raw_pnl * current_usdjpy_rate
                     elif sym == "USDCAD":
-                        current_usdcad_rate = row.get(f"USDCAD_{tf}_close", 1.35) # 該当時間軸の終値
+                        current_usdcad_rate = row.get(f"USDCAD_{tf}_close_raw", 1.35) # 該当時間軸の終値
                         converted_pnl = raw_pnl * (current_usdjpy_rate / current_usdcad_rate)
                         
                     step_realized_pnl += converted_pnl
