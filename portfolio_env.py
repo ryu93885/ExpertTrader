@@ -30,11 +30,17 @@ class PortfolioFXEnv(gym.Env):
         self.initial_balance = initial_balance
         
         # 銘柄ごとの設定値（コントラクトサイズやポイントバリュー）
-        # ※実運用時は各銘柄の正しい値を辞書で渡す設計に拡張してください
-        self.symbol_configs = {
-            sym: {"point_value": 0.001, "contract_size": 100000} if "USDJPY" in sym or "EUR" in sym else {"point_value": 0.01, "contract_size": 100} # GOLD等
-            for sym in self.symbols
-        }
+        # 💡 修正: 旧ロジックは "USDJPY" or "EUR" を含むかどうかだけで判定しており、
+        # GBPUSD/AUDUSD/GBPJPY が誤ってGOLDと同じ扱い(contract_size=100)になっていた。
+        # 実際の気配値の桁数(JPYペアは小数3桁、その他は小数5桁、GOLDは小数2桁)に基づいて判定する。
+        def _get_symbol_config(sym):
+            if "JPY" in sym:
+                return {"point_value": 0.001, "contract_size": 100000}
+            if "GOLD" in sym or "XAU" in sym:
+                return {"point_value": 0.01, "contract_size": 100}
+            return {"point_value": 0.00001, "contract_size": 100000}
+
+        self.symbol_configs = {sym: _get_symbol_config(sym) for sym in self.symbols}
 
         # アクション空間: 3アクション(方向, TP, SL) × 7銘柄 = 21次元
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_symbols * 3,), dtype=np.float32)
@@ -225,7 +231,9 @@ class PortfolioFXEnv(gym.Env):
                 else:
                     target_lot = 0.01
                 
-                raw_spread_cost = target_lot * spread * config["contract_size"]
+                # 💡 修正: MT5の spread は「ポイント数」(整数)であり価格差そのものではないため、
+                # point_value を掛けて価格単位に変換してからコストを計算する(旧実装は1000倍程度過大だった)。
+                raw_spread_cost = target_lot * spread * config["point_value"] * config["contract_size"]
                 if "JPY" in sym:
                     spread_cost = raw_spread_cost
                 elif "USD" in sym or "GOLD" in sym:

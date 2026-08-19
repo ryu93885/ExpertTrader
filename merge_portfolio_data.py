@@ -79,13 +79,18 @@ def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "
         raw_df["time"] = pd.to_datetime(raw_df["time"])
  
         # 対象の生列だけを抽出（例: M5_close, M5_high, M5_low, M5_spread, M5_ATR, M15_ATR ...）
+        # 💡 修正: 旧実装は col.endswith(f"_{suf}") で判定していたため、
+        # M5_high_low_spread や M5_close_open_spread のような、既に%変換済みの
+        # テクニカル指標列まで「生のspread列」として誤って拾ってしまっていた。
+        # "{時間軸}_{フィールド名}" の完全一致（アンダースコア1回区切り）でのみ判定する。
         raw_cols = ["time"]
         for col in raw_df.columns:
             if col == "time":
                 continue
             if col in RAW_FIELD_EXCLUDE:
                 continue
-            if any(col.endswith(f"_{suf}") or col == suf for suf in RAW_FIELD_SUFFIXES):
+            _, _, field_name = col.partition("_")
+            if field_name in RAW_FIELD_SUFFIXES:
                 raw_cols.append(col)
  
         raw_df = raw_df[raw_cols]
