@@ -33,9 +33,9 @@ LOG_DIR = "trading_logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # 資金管理・インターバル設定
-RISK_CONFIG = {"short": 0.05, "medium": 0.10, "long": 0.12}
 INTERVAL_CONFIG = {"short": 5 * 60, "medium": 15 * 60, "long": 4 * 60 * 60}
 MAGIC_NUMBER = 20260626
+MIN_RR_RATIO = 1.5  # portfolio_env.py の学習時ロジックと一致させる最低リスクリワード比
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -63,8 +63,7 @@ class PortfolioFXTradingBot:
         self.obs_shape = ((4 + 2) * self.num_symbols + 1,)
         self.num_actions = self.num_symbols * 3
         
-        self.initial_balance = None 
-        self.max_lot_sizes = {sym: 0.01 for sym in self.symbols}
+        self.initial_balance = None
         self.vec_normalize = None
 
         # スケーラーのロード
@@ -286,15 +285,21 @@ class PortfolioFXTradingBot:
             if abs(act_direction) > threshold:
                 direction_sign = 1.0 if act_direction > 0 else -1.0
                 
+                base_tf = "M5" if self.mode == "short" else "M15" if self.mode == "medium" else "H4"
                 tf = "M15" if self.mode == "short" else "H4" if self.mode == "medium" else "D1"
-                current_close = raw_dfs[sym][f"{tf}_close"].iloc[-1]
+                current_close = raw_dfs[sym][f"{base_tf}_close"].iloc[-1]
                 atr = raw_dfs[sym].get(f"{tf}_ATR", current_close * 0.005)
                 if isinstance(atr, pd.Series): atr = atr.iloc[-1]
-                
+
                 # Envと完全に一致したTP/SL距離の計算
-                tp_dist = atr * (1.0 + (act_tp + 1.0) * 2)
                 sl_dist = atr * (1.0 + (act_sl + 1.0))
-                
+                tp_dist = atr * (1.0 + (act_tp + 1.0) * 2)
+
+                # Envと同じ最低リスクリワード比(MIN_RR_RATIO倍)のクランプ
+                min_tp_dist = sl_dist * MIN_RR_RATIO
+                if tp_dist < min_tp_dist:
+                    tp_dist = min_tp_dist
+
                 # Envと完全に一致した動的ロット計算（リスク2%ベース）
                 risk_amount = equity * 0.02 * abs(act_direction)
                 
@@ -382,40 +387,6 @@ class PortfolioFXTradingBot:
         # 2. フラグが0（設定なし）の場合の「XM向け」強力なフォールバック
         
         return mt5.ORDER_FILLING_IOC
-    
-    def _update_max_lot_size(self, symbol):
-        """正確なPIP価値に基づくロット上限計算"""
-        try:
-            account = mt5.account_info()
-            symbol_info = mt5.symbol_info(symbol)
-            if account is None or symbol_info is None: return
-
-            equity = account.equity 
-            
-            # 【変更点1】ポートフォリオ分散の過剰な縮小を緩和し、設定通りのリスクを適用
-            risk_pct = RISK_CONFIG.get(self.mode, 0.05)
-            allowable_risk = equity * risk_pct 
-
-            # 【変更点2】不正確だった損失計算式を、50pips想定の正確な計算に修正
-            tick_value = symbol_info.trade_tick_value
-            tick_size = symbol_info.trade_tick_size
-            
-            if tick_value and tick_size > 0:
-                # JPYペアなら 0.50 (50pips)、USDペアなら 0.0050 (50pips) の価格変動を想定
-                expected_movement = 0.50 if "JPY" in symbol else 0.0050
-                points = expected_movement / tick_size
-                loss_per_lot = points * tick_value
-            else:
-                loss_per_lot = 500.0 # 取得できない場合のデフォルト
-
-            calculated_lot = allowable_risk / max(loss_per_lot, 1e-5)
-
-            step_lot = symbol_info.volume_step
-            calculated_lot = round(calculated_lot / step_lot) * step_lot
-            self.max_lot_sizes[symbol] = max(symbol_info.volume_min, min(calculated_lot, symbol_info.volume_max))
-
-        except Exception as e:
-            logger.error(f"❌ [{symbol}] 資金管理エラー: {e}")
 
 def main():
     print("========================================")
