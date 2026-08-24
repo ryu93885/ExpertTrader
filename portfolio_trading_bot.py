@@ -60,11 +60,19 @@ class PortfolioFXTradingBot:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 観測・行動空間の次元
-        self.obs_shape = ((4 + 2) * self.num_symbols + 1,)
+        # 💡 portfolio_env.py ver209.0 と合わせ、銘柄別の直近連敗数(1) を追加
+        self.obs_shape = ((4 + 2 + 1) * self.num_symbols + 1,)
         self.num_actions = self.num_symbols * 3
-        
+
         self.initial_balance = None
         self.vec_normalize = None
+
+        # 💡 portfolio_env.py の self.recent_losses (銘柄別・直近連敗数) と同じ役割。
+        # ライブでは学習時のようにその場でSL/TP判定できないため、
+        # 「前回チェック時にあったポジションが今回無くなっている」ことを検知し、
+        # MT5の約定履歴から損失決済だったかを確認して更新する(_update_recent_losses参照)。
+        self.recent_losses = {sym: 0.0 for sym in self.symbols}
+        self._last_known_position = {sym: 0.0 for sym in self.symbols}
 
         # スケーラーのロード
         self.scalers = {}
@@ -150,6 +158,42 @@ class PortfolioFXTradingBot:
             return 0.0
         total_profit = sum(p.profit for p in positions if p.magic == MAGIC_NUMBER)
         return total_profit / max(balance, 1e-8)
+
+    def _update_recent_losses(self):
+        """
+        portfolio_env.py の self.recent_losses(銘柄別・直近連敗数)をライブ側でも再現する。
+        学習時はステップ内でSL/TP判定と同時に連敗数を更新できるが、ライブではブローカーが
+        自動でSL/TPを執行するため、「前回チェック時にあったポジションが今回無くなっている」
+        ことをもって決済を検知し、MT5の約定履歴からその決済が損失だったかを確認する。
+        呼び出しごと(=学習時の1ステップに相当)に、全銘柄を0.9倍で減衰させる。
+        """
+        now = datetime.now()
+        interval = INTERVAL_CONFIG.get(self.mode, 300)
+        lookback_start = now - timedelta(seconds=interval * 3 + 3600)
+
+        for sym in self.symbols:
+            current_pos = self._get_current_position(sym)
+            prev_pos = self._last_known_position.get(sym, 0.0)
+
+            if prev_pos != 0.0 and current_pos == 0.0:
+                try:
+                    deals = mt5.history_deals_get(lookback_start, now, group=sym)
+                except Exception as e:
+                    deals = None
+                    logger.warning(f"⚠️ [{sym}] 約定履歴の取得に失敗しました: {e}")
+
+                if deals:
+                    closing_deals = [d for d in deals if d.magic == MAGIC_NUMBER and d.entry == mt5.DEAL_ENTRY_OUT]
+                    if closing_deals:
+                        latest_deal = max(closing_deals, key=lambda d: d.time)
+                        if latest_deal.profit < 0:
+                            self.recent_losses[sym] = self.recent_losses.get(sym, 0.0) + 1.0
+                            logger.info(f"📉 [{sym}] 決済損失を検知。連敗カウント: {self.recent_losses[sym]:.2f}")
+
+            self._last_known_position[sym] = current_pos
+
+        for sym in self.symbols:
+            self.recent_losses[sym] = self.recent_losses.get(sym, 0.0) * 0.9
 
     def _build_sac_observation(self):
         imgs_list = []
@@ -251,6 +295,8 @@ class PortfolioFXTradingBot:
             obs_list.append(risk_vals[i][0])
             obs_list.append(float(self._get_current_position(sym)))
             obs_list.append(self._get_unrealized_pnl_ratio(sym, account_info.balance))
+            # 💡 portfolio_env.py ver209.0 と同じ並び順で、銘柄別の直近連敗数を末尾に追加
+            obs_list.append(float(self.recent_losses.get(sym, 0.0)))
 
         hybrid_obs_array = np.array([obs_list], dtype=np.float32)
         if self.vec_normalize is not None:
@@ -259,8 +305,10 @@ class PortfolioFXTradingBot:
         return hybrid_obs_array, raw_dfs
 
     def execute_trade_logic(self):
-    
-            
+
+        # 💡 観測を作る前に、前回チェックからの決済(勝敗)を反映して連敗数を更新する
+        self._update_recent_losses()
+
         logger.info("📡 ポートフォリオ全銘柄の相場データを取得・推論中...")
         obs, raw_dfs = self._build_sac_observation()
         if obs is None: return
