@@ -2,10 +2,12 @@
 # ポートフォリオ強化学習(SAC)の再学習パイプライン。
 # portfolio_env.py / merge_portfolio_data.py の整合性修正を反映した状態で、
 # 1. データ統合 (merge_portfolio_data.py)
-# 2. アナライザ推論結果の事前計算 (precompute_portfolio.py)
+# 2. アナライザ推論結果の事前計算 (precompute_portfolio.py, train/testの両フェーズ)
 # 3. SACエージェントの学習 (train_portfolio_rl.py)
 # を順番に実行する。setup_codespace.sh を先に実行し、データが揃っていることを
 # 確認してから使ってください。
+# 💡 test フェーズの事前計算も行うことで、学習後に test_portfolio.py で
+#   そのままバックテストできる状態にしておく。
 #
 #   bash run_portfolio_retrain.sh
 #
@@ -39,14 +41,19 @@ echo "=== 1/3: データ統合 (merge_portfolio_data.py) ==="
 python merge_portfolio_data.py
 
 echo ""
-echo "=== 2/3: アナライザ推論結果の事前計算 (precompute_portfolio.py) ==="
-python precompute_portfolio.py
+echo "=== 2/4: アナライザ推論結果の事前計算 - train (precompute_portfolio.py) ==="
+python precompute_portfolio.py --phase train --mode "$MODE"
 
 echo ""
-echo "=== 3/3: ポートフォリオRL(SAC)の学習 (train_portfolio_rl.py) ==="
+echo "=== 3/4: アナライザ推論結果の事前計算 - test (precompute_portfolio.py) ==="
+python precompute_portfolio.py --phase test --mode "$MODE"
+
+echo ""
+echo "=== 4/4: ポートフォリオRL(SAC)の学習 (train_portfolio_rl.py) ==="
 python train_portfolio_rl.py
 
 echo ""
 echo "=== 完了 ==="
 echo "学習済みモデル: saved_rl_models/sac_portfolio_agent_${MODE}.zip"
 echo "旧モデルのバックアップ: $BACKUP_DIR/"
+echo "バックテスト: python test_portfolio.py --mode ${MODE} で検証できます"

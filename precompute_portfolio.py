@@ -1,3 +1,4 @@
+import argparse
 import torch
 from torch.utils.data import DataLoader,dataloader
 import pandas as pd
@@ -17,13 +18,22 @@ def collate_fn_drop_none(batch):
     return dataloader.default_collate(batch)
 
 def main():
-    logging.info("precompute_portfolio.py ver208.2")
+    logging.info("precompute_portfolio.py ver209.0")
+    # 💡 修正: 以前は "train" フェーズ専用に固定されており、test_portfolio.py が
+    # 必要とする "portfolio_merged_data_test_with_preds.csv" を作る手段が存在しなかった。
+    # (merge_portfolio_data.py は train/test 両方を出力するのに、precompute側が
+    #  trainしか処理できず、test側は prob_0/1/2・risk_val が永遠に追加されないままだった)
+    parser = argparse.ArgumentParser(description="ポートフォリオ用の事前推論(prob/risk列の追加)")
+    parser.add_argument("--phase", type=str, default="train", choices=["train", "test"], help="対象フェーズ")
+    parser.add_argument("--mode", type=str, default="short", choices=["short", "medium", "long"], help="対象モード")
+    args = parser.parse_args()
+
     symbols = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
-    mode = "short"
-    merged_csv = "portfolio_merged_data_train.csv"
+    mode = args.mode
+    merged_csv = f"portfolio_merged_data_{args.phase}.csv"
     img_dir = "images"
     model_path = f"saved_model/final_best_model_{mode}.pth"
-    output_csv = "portfolio_merged_data_train_with_preds.csv"
+    output_csv = f"portfolio_merged_data_{args.phase}_with_preds.csv"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"デバイス:{device}")

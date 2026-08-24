@@ -24,7 +24,13 @@ def main():
     parser.add_argument("--symbols",default=["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"])
     parser.add_argument("--mode",default = "short",help = "モード選択",choices = ["short","medium","long"])
     args = parser.parse_args()
-    test_csv = "portfolio_merged_data_test.csv"
+    # 💡 修正: PortfolioFXEnv は prob_0/1/2・risk_val 列を必要とするが、
+    # これらは precompute_portfolio.py --phase test で追加された
+    # "_with_preds" 付きファイルにしか存在しない。"_with_preds" の付かない
+    # 生の merge_portfolio_data.py の出力をそのまま使うと、これらの列が
+    # 存在せず、エージェントが常に prob=0/risk=0 の観測で動くという
+    # 気づきにくい形で結果が壊れてしまう。
+    test_csv = "portfolio_merged_data_test_with_preds.csv"
     img_dir = "images"
 
     # 💡 修正: 実際の保存ファイル名(train_portfolio_rl.py)には mode サフィックスが
@@ -36,7 +42,11 @@ def main():
     logging.info(f"Using device:{device}")
 
     if not os.path.exists(test_csv):
-        logging.error(f"✖テストデータ{test_csv}が見つかりません.merge_portfolio_data.pyを実行してください")
+        logging.error(
+            f"✖テストデータ{test_csv}が見つかりません。"
+            f"merge_portfolio_data.py の実行後、"
+            f"python precompute_portfolio.py --phase test --mode {args.mode} を実行してください"
+        )
         return
 
     logging.info("テスト用データセットを読み込んでいます....")
