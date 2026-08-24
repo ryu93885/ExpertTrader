@@ -133,8 +133,26 @@ def print_symbol_report(pair_name, cls_true, cls_pred, risk_true, risk_pred):
         label_str = {-1: "SELL", 0: "HOLD", 1: "BUY"}[dominant_class]
         bias_flag = f"  ⚠️ 予測の{pred_ratio[dominant_class]:.0%}が{label_str}に偏っています（方向バイアスの疑いあり）"
 
+    # 🌟 target_risk_pct 自体が元々小さいスケールの値のため、MAE単体では
+    #    「性能が良い/バグがある」を判断できない。基準値として、
+    #    対象の平均・標準偏差、および「平均値を毎回予測した場合のMAE(ナイーブ基準)」を併記する。
+    risk_note = ""
+    if len(risk_true) > 0:
+        risk_arr = np.array(risk_true, dtype=np.float64)
+        risk_mean_val = float(risk_arr.mean())
+        risk_std_val = float(risk_arr.std())
+        naive_mae = float(np.mean(np.abs(risk_arr - risk_mean_val)))
+        improvement = (1 - mae / naive_mae) * 100 if naive_mae > 1e-8 else float("nan")
+        risk_bias_flag = ""
+        if naive_mae > 1e-8 and mae >= naive_mae * 0.9:
+            risk_bias_flag = "  ⚠️ 平均値をただ予測した場合とほぼ同じ精度＝リスク回帰が機能していない可能性"
+        risk_note = (
+            f"\n  [Risk基準値] 対象の平均: {risk_mean_val:.6f}% / 標準偏差: {risk_std_val:.6f}% / "
+            f"平均値で固定予測した場合のMAE: {naive_mae:.6f}% (モデルはこれより {improvement:.1f}% 改善){risk_bias_flag}"
+        )
+
     print(f"\n=== [{pair_name}]  (評価サンプル数: {n}){bias_flag} ===")
-    print(f"  Accuracy: {acc:.4f} | Risk MAE: {mae:.6f}%")
+    print(f"  Accuracy: {acc:.4f} | Risk MAE: {mae:.6f}%{risk_note}")
     print(
         f"  正解の内訳: SELL {true_counts[-1]:>4} ({true_counts[-1]/n:>6.1%})  "
         f"HOLD {true_counts[0]:>4} ({true_counts[0]/n:>6.1%})  "
@@ -325,7 +343,16 @@ def main():
     for i, true_label in enumerate(['SELL', 'HOLD', 'BUY']):
         row_str = " ".join([f"{val:<5}" for val in cm[i]])
         print(f"True: {true_label:<4}  {row_str}")
-    logging.info(f"--- Overall Risk Prediction MAE: {mean_absolute_error(t_risk, p_risk):.6f}% ---")
+    overall_mae = mean_absolute_error(t_risk, p_risk)
+    # 🌟 全銘柄プールでのナイーブ基準(平均値を毎回予測した場合)。
+    #    銘柄ごとにtarget_risk_pctのスケールが異なるため参考値だが、
+    #    「MAEが小さいのは対象自体のスケールが小さいだけでは」という疑問への簡易チェックになる。
+    t_risk_arr = np.array(t_risk, dtype=np.float64)
+    overall_naive_mae = float(np.mean(np.abs(t_risk_arr - t_risk_arr.mean()))) if len(t_risk_arr) > 0 else float("nan")
+    logging.info(
+        f"--- Overall Risk Prediction MAE: {overall_mae:.6f}% "
+        f"(参考: 対象の平均値で固定予測した場合のMAE = {overall_naive_mae:.6f}%。銘柄別の詳細は下記参照) ---"
+    )
 
     # ------------------------------------------------------------
     # 🌟 銘柄別レポート：GOLD/GBPJPYのような特定銘柄の方向バイアスを見つけるための本題
