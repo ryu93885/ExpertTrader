@@ -20,7 +20,7 @@ class PortfolioFXEnv(gym.Env):
     def __init__(self, dataset,symbols, initial_balance=10000000):
         super(PortfolioFXEnv, self).__init__()
         logging.info("PortfolioFXEnv: 21-Action Multi-Asset Initialization")
-        logging.info("portfolio_env.py ver208.2")
+        logging.info("portfolio_env.py ver209.0")
         
         self.dataset = dataset
         
@@ -46,8 +46,8 @@ class PortfolioFXEnv(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_symbols * 3,), dtype=np.float32)
         
         # 観察空間の次元計算（適宜調整）:
-        # モデル出力(4) + ポジション状態(2) = 6 × 7銘柄 = 42次元 + 口座残高比率(1) = 43次元
-        obs_dim = (4 + 2) * self.num_symbols + 1
+        # モデル出力(4) + ポジション状態(2) + 銘柄別直近連敗数(1) = 7 × 7銘柄 = 49次元 + 口座残高比率(1) = 50次元
+        obs_dim = (4 + 2 + 1) * self.num_symbols + 1
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
         
         self.reset_env_variables()
@@ -65,7 +65,10 @@ class PortfolioFXEnv(gym.Env):
         self.tp_prices = {sym:0.0 for sym in self.symbols}
         self.sl_prices = {sym:0.0 for sym in self.symbols}
         self.current_step = self.dataset.seq_length
-        self.recent_losses = 0.0
+        # 💡 修正: 以前はポートフォリオ全体で1つのスカラーだった連敗カウンターを、
+        # 銘柄ごとの辞書に変更。_get_observation() にも含めることで、
+        # エージェントが「この銘柄で連敗している」ことを直接認識できるようにする。
+        self.recent_losses = {sym: 0.0 for sym in self.symbols}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -133,7 +136,10 @@ class PortfolioFXEnv(gym.Env):
                 unrealized_pnl_ratio = converted_pnl / max(self.balance, 1e-8)
                 
             obs_list.append(unrealized_pnl_ratio)
-            
+
+            # 銘柄別の直近連敗数(このエピソード内でのSL連続回数。ステップごとに0.9倍で減衰)
+            obs_list.append(float(self.recent_losses.get(sym, 0.0)))
+
         return np.array(obs_list, dtype=np.float32)
 
     def step(self, action):
@@ -191,7 +197,7 @@ class PortfolioFXEnv(gym.Env):
                         is_sl_closed = True
 
                 if is_sl_closed:
-                    self.recent_losses += 1.0
+                    self.recent_losses[sym] += 1.0
                     future_start = self.current_step+1
                     future_end = min(len(self.dataset.df),self.current_step + 21)
                     if future_start<future_end:
@@ -279,8 +285,9 @@ class PortfolioFXEnv(gym.Env):
         unrealized_reward = (delta_unrealized / self.initial_balance) * 100.0 * UNREALIZED_PNL_WEIGHT
         base_reward = realized_reward + unrealized_reward
 
-        self.recent_losses *= 0.9
-        consecutive_loss_penalty = self.recent_losses * CONSECUTIVE_LOSS_PENALTY_COEF
+        for sym in self.symbols:
+            self.recent_losses[sym] *= 0.9
+        consecutive_loss_penalty = sum(self.recent_losses.values()) * CONSECUTIVE_LOSS_PENALTY_COEF
         reward = base_reward - counterfactual_penalty - consecutive_loss_penalty
 
         self.prev_unrealized_pnl = unrealized_pnl_total
