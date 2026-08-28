@@ -22,7 +22,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 # カスタムモジュールのパス設定
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from datafetch_modeltrain.model import MultimodalFXmodel
+from datafetch_modeltrain.model import MultimodalFXmodel, SYMBOL_TO_ID
 from trade.live_datafetch import get_live_features
 
 # ディレクトリ設定
@@ -204,6 +204,9 @@ class PortfolioFXTradingBot:
     def _build_sac_observation(self):
         imgs_list = []
         tabs_list = []
+        # 💡 B案: 銘柄埋め込み用のID。datafetch_modeltrain/model.py の SYMBOL_TO_ID を
+        # 唯一の対応表として使い、学習側とライブ側でズレないようにする。
+        symbol_id_list = [SYMBOL_TO_ID[sym] for sym in self.symbols]
         raw_dfs = {}
         
         image_transform = transforms.Compose([
@@ -286,9 +289,10 @@ class PortfolioFXTradingBot:
 
         imgs_tensor = torch.cat(imgs_list, dim=0).to(self.device)
         tabs_tensor = torch.cat(tabs_list, dim=0).to(self.device)
+        symbol_id_tensor = torch.tensor(symbol_id_list, dtype=torch.long, device=self.device)
 
         with torch.no_grad():
-            class_out, risk_out = self.analyst_model(imgs_tensor, tabs_tensor)
+            class_out, risk_out = self.analyst_model(imgs_tensor, tabs_tensor, symbol_id_tensor)
             probs = torch.softmax(class_out, dim=1).cpu().numpy()
             risk_vals = risk_out.cpu().numpy()
 
