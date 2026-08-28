@@ -374,16 +374,26 @@ class PortfolioFXTradingBot:
         account = mt5.account_info()
         if account is not None:
             equity = account.equity
-            currency = getattr(account, 'currency', 'USD')
-            base_unit = 1000.0 if currency == "USD" else 100000.0
-            
-            if "GOLD" in symbol or "XAU" in symbol:
-                safety_multiplier = 0.02 # GOLDは1000ドルあたり最大0.02ロット
+            symbol_info_cap = mt5.symbol_info(symbol)
+
+            # 💡 修正: 旧実装は「資産1000ドル/10万円あたり固定ロット」という、
+            # SL距離(sl_dist)を一切考慮しない静的な上限だった。このため、GOLDのように
+            # ATRに応じてSL距離が広がる場面で、実際のリスクが意図した2%を大きく
+            # 超過していた(実測でリスク6.9%〜12.2%、最大約6倍)。
+            # execute_trade_logic()の2%リスク計算と同じ sl_dist 連動のロジックで、
+            # その2倍(4%)を「通常あり得ないはずの異常値」に対する最終防御ラインとする。
+            MAX_RISK_PCT_HARD_CAP = 0.04
+            if symbol_info_cap and symbol_info_cap.trade_tick_size > 0 and sl_dist > 0:
+                loss_per_price_unit = symbol_info_cap.trade_tick_value / symbol_info_cap.trade_tick_size
+                loss_for_this_trade_per_lot = sl_dist * loss_per_price_unit
+                absolute_safety_cap = max(0.01, round((equity * MAX_RISK_PCT_HARD_CAP) / max(loss_for_this_trade_per_lot, 1e-5), 2))
             else:
-                safety_multiplier = 0.10 # 通常FXは1000ドルあたり最大0.10ロット
-                
-            absolute_safety_cap = max(0.01, round((equity / base_unit) * safety_multiplier, 2))
-            
+                # symbol_info や sl_dist が取得できない場合の最終フォールバック(従来の静的上限)
+                currency = getattr(account, 'currency', 'USD')
+                base_unit = 1000.0 if currency == "USD" else 100000.0
+                safety_multiplier = 0.02 if ("GOLD" in symbol or "XAU" in symbol) else 0.10
+                absolute_safety_cap = max(0.01, round((equity / base_unit) * safety_multiplier, 2))
+
             if lots > absolute_safety_cap:
                 logger.warning(f"⚠️ [{symbol}] 防御フィルター作動: AIの要求ロットを {absolute_safety_cap:.2f} Lot に制限。")
                 lots = absolute_safety_cap
