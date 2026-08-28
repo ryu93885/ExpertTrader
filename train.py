@@ -33,45 +33,67 @@ SEQ_LENGTH = 40
 
 def calculate_auto_class_weights(csv_paths, method="sqrt", device="cpu", sample_ratio=0.2):
     """
-    全銘柄のCSVから、指定した割合（sample_ratio）だけデータを抽出し、
-    全体のバランスを反映したクラスウェイトを計算する。
+    銘柄ごとに独立してクラスウェイトを計算し、それらを単純平均して最終的な重みを決定する。
+
+    💡 修正: 旧実装は全銘柄のラベルを1つのプールに混ぜてから重みを計算していたため、
+    行数の多い銘柄(データ期間が長い/取得頻度が高い銘柄)の分布が結果を支配し、
+    行数の少ない銘柄固有の偏り(例: GBPJPYのHOLD過多)が薄まって補正されなかった。
+    銘柄ごとに重みを個別計算してから単純平均することで、データ量によらず各銘柄が
+    等しく重みの決定に反映されるようにする。
     """
-    all_labels = []
-    
+    num_classes = 3
+    per_symbol_weights = []
+
     for path in csv_paths:
+        filename = os.path.basename(path).replace(".csv", "")
+        parts = filename.split("_")
+        # tmp_train_csv は "temp_train_{symbol}_{mode}.csv" の形式
+        symbol = parts[2] if len(parts) >= 3 else filename
+
         df = pd.read_csv(path)
         # 1. 各銘柄のラベルを取得 (0: SELL, 1: HOLD, 2: BUY に補正)
         labels = (df["target_class"] + 1).tolist()
-        
+
         # 2. 全体を読み込むのではなく、時系列の偏りを防ぐために等間隔でサンプリングする
         # 例: sample_ratio=0.2 なら、5行に1行のペースで抽出（時系列の傾向は維持される）
         step = max(1, int(1 / sample_ratio))
-        sampled_labels = labels[::step] 
-        
-        all_labels.extend(sampled_labels)
+        sampled_labels = labels[::step]
 
-    counts = Counter(all_labels)
-    total_samples = sum(counts.values())
-    num_classes = 3
+        counts = Counter(sampled_labels)
+        total_samples = sum(counts.values())
+        if total_samples == 0:
+            continue
 
-    weights = []
-    for i in range(num_classes):
-        # ゼロ除算を防ぐため、最低でも1とする
-        w = total_samples / (num_classes * counts.get(i, 1))
-        weights.append(w)
-    
-    if method == "sqrt":
-        weights = np.sqrt(weights).tolist()
+        weights = []
+        for i in range(num_classes):
+            # ゼロ除算を防ぐため、最低でも1とする
+            w = total_samples / (num_classes * counts.get(i, 1))
+            weights.append(w)
 
-    # HOLDの重みを1.0として正規化
-    hold_weight = weights[1] if len(weights) > 1 else 1.0
-    normalized_weights = [w / hold_weight for w in weights]
-    
-    print(f"\n--- 自動重み計算 ({method} mode, 全銘柄サンプリング率: {sample_ratio*100}%) ---")
-    print(f"抽出されたデータ件数: SELL={counts.get(0, 0)}, HOLD={counts.get(1, 0)}, BUY={counts.get(2, 0)}")
-    print(f"適用される正規化ウェイト: SELL={normalized_weights[0]:.4f}, HOLD={normalized_weights[1]:.4f}, BUY={normalized_weights[2]:.4f}\n")
-    
-    return torch.tensor(normalized_weights, dtype=torch.float32).to(device)
+        if method == "sqrt":
+            weights = np.sqrt(weights).tolist()
+
+        # HOLDの重みを1.0として正規化
+        hold_weight = weights[1] if weights[1] > 0 else 1.0
+        normalized = [w / hold_weight for w in weights]
+
+        per_symbol_weights.append(normalized)
+        print(
+            f"  [{symbol}] SELL={counts.get(0, 0)}, HOLD={counts.get(1, 0)}, BUY={counts.get(2, 0)} "
+            f"-> weight SELL={normalized[0]:.4f} HOLD={normalized[1]:.4f} BUY={normalized[2]:.4f}"
+        )
+
+    if not per_symbol_weights:
+        logging.warning("クラスウェイトを計算できるデータがありませんでした。重み1.0を使用します。")
+        return torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32).to(device)
+
+    # 銘柄ごとの重みベクトルを単純平均(データ量の多い銘柄に支配されないようにする)
+    avg_weights = np.mean(per_symbol_weights, axis=0).tolist()
+
+    print(f"\n--- 自動重み計算 ({method} mode, 銘柄別に計算して平均, サンプリング率: {sample_ratio*100}%) ---")
+    print(f"適用される正規化ウェイト(銘柄平均): SELL={avg_weights[0]:.4f}, HOLD={avg_weights[1]:.4f}, BUY={avg_weights[2]:.4f}\n")
+
+    return torch.tensor(avg_weights, dtype=torch.float32).to(device)
 
 
 def setup_logger():

@@ -10,7 +10,7 @@ from tqdm import tqdm
 import argparse
 
 # --- setting ---
-DEFAULT_SYMBOLS = ["USDJPY", "EURUSD", "GBPUSD", "EURJPY", "GBPJPY", "AUDUSD", "XAUUSD"]
+DEFAULT_SYMBOLS = ["USDJPY", "EURUSD", "GBPUSD", "EURJPY", "GBPJPY", "AUDUSD", "GOLD"]
 WINDOW_SIZE = 60
 MTF_IMAGE_SIZE = (9.33, 9.33)
 DPI = 72
@@ -145,9 +145,15 @@ def generate_mtf_images_for_symbol(symbol, mode,start_date = None,end_date = Non
             continue
 
         # 過去 WINDOW_SIZE (60) 本分のデータを一括で切り出し
-        window_base = df_base.iloc[i - WINDOW_SIZE : i]
-        window_mid  = df_mid.iloc[i - WINDOW_SIZE : i]
-        window_long = df_long.iloc[i - WINDOW_SIZE : i]
+        # 💡 修正: 旧実装は iloc[i-60:i] で判断時点(行i)自体を含んでおらず、
+        # (a) 同じ学習データのタブラー特徴量側(dataset.py)は iloc[start:target_idx+1] で
+        #     行iを含んでいるため、画像とタブラーで基準時刻がズレていた
+        # (b) ライブ側(portfolio_trading_bot.py)の画像は raw_df.tail(60) で現在足を
+        #     含んでいるため、学習時とライブで見せている情報が1本分ズレていた
+        # 判断時点(行i)を含む直近60本になるよう、窓を1本分だけ後ろにずらす。
+        window_base = df_base.iloc[i - WINDOW_SIZE + 1 : i + 1]
+        window_mid  = df_mid.iloc[i - WINDOW_SIZE + 1 : i + 1]
+        window_long = df_long.iloc[i - WINDOW_SIZE + 1 : i + 1]
 
         # 1枚のMTF画像として描画・保存
         tasks.append((window_base,window_mid,window_long,save_path))

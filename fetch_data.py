@@ -13,7 +13,9 @@ TRADING_MODES = {
 }
 
 #default stock list
-DEFAULT_SYMGOLS = ["USDJPY","EURUSD","GBPUSD","EURJPY","GBPJPY","AUDUSD","XAUUSD"]
+# 💡 修正: "XAUUSD" ではなく、このブローカーの実際のMT5銘柄名 "GOLD" に修正
+# (portfolio_trading_bot.py 等、システム全体で使われている名称と統一)
+DEFAULT_SYMBOLS = ["USDJPY","EURUSD","GBPUSD","EURJPY","GBPJPY","AUDUSD","GOLD"]
 
 def setup_logger():
     #log settings:console output and file storage
@@ -103,11 +105,11 @@ def main():
         if args.symbol:
             symbols_input = args.symbol
         else:
-            print(f"default stock: {','.join(DEFAULT_SYMGOLS)}")
+            print(f"default stock: {','.join(DEFAULT_SYMBOLS)}")
             symbols_input = input("Please enter the stocks you want to analyze, separated by commas (pressing Enter with a blank field will apply the default values): ").strip().upper()
 
         if not symbols_input:
-            target_symbols = DEFAULT_SYMGOLS
+            target_symbols = DEFAULT_SYMBOLS
             logging.info(f"no user input. use default. -> {target_symbols}")
         else:
             target_symbols = [s.strip().upper() for s in symbols_input.split(',') if s.strip()]

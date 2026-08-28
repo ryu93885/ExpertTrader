@@ -49,12 +49,21 @@ def create_labels(df, tf_name, lookahead_bars, threshold_factor,symbol):
         df["target_risk_pct"] = 0.0
         return df
 
+    # 💡 修正: 旧実装は0を中心に対称な閾値(±std*factor)を使っていたため、
+    # ラベル付け期間にその銘柄が一方向にトレンドしていた場合(例: GOLDの上昇局面)、
+    # 「これから反転するか」ではなく「その期間たまたま上昇していたか」を学習して
+    # しまい、BUY/SELLラベル数が偏っていた。分布の平均(price_diff_mean、その期間の
+    # ドリフト成分)を差し引いた上で、標準偏差ベースの閾値と比較するように変更する。
+    price_diff_mean = valid_diff.mean()
     price_diff_std = valid_diff.std()
     dynamic_threshold_pct = price_diff_std * threshold_factor
-    logging.info(f"  📊 銘柄動的解析 [{symbol}]: 全体標準偏差 = {price_diff_std:.4f}% ➡️ 自動閾値 = {dynamic_threshold_pct:.4f}% (倍率: {threshold_factor}x)")
+    logging.info(
+        f"  📊 銘柄動的解析 [{symbol}]: 平均 = {price_diff_mean:.4f}% / 標準偏差 = {price_diff_std:.4f}% "
+        f"➡️ 自動閾値 = 平均 ± {dynamic_threshold_pct:.4f}% (倍率: {threshold_factor}x)"
+    )
     df['target_class'] = 0
-    df.loc[df['price_diff_pct'] >= dynamic_threshold_pct, 'target_class'] = 1
-    df.loc[df['price_diff_pct'] <= -dynamic_threshold_pct, 'target_class'] = -1
+    df.loc[df['price_diff_pct'] >= price_diff_mean + dynamic_threshold_pct, 'target_class'] = 1
+    df.loc[df['price_diff_pct'] <= price_diff_mean - dynamic_threshold_pct, 'target_class'] = -1
 
     # --- 2. regression label ---
     future_min = df[low_col].rolling(window=lookahead_bars).min().shift(-lookahead_bars)

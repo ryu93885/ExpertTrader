@@ -11,7 +11,7 @@ TRADING_MODE = {
     "long":["H4","D1","W1"]
 }
 
-DEFAULT_SYMGOLS = ["USDJPY","EURUSD","GBPUSD","EURJPY","GBPJPY","AUDUSD","XAUUSD"]
+DEFAULT_SYMBOLS = ["USDJPY","EURUSD","GBPUSD","EURJPY","GBPJPY","AUDUSD","GOLD"]
 
 def setup_logger():
     log_dir = "logs"
@@ -193,9 +193,9 @@ def main():
     if args.symbol:
         symbols = [s.strip().upper() for s in args.symbol.split(',')]
     else:
-        print(f"Default stocks: {','.join(DEFAULT_SYMGOLS)}")
+        print(f"Default stocks: {','.join(DEFAULT_SYMBOLS)}")
         symbol_input = input("Please enter the stocks to be processed, separated by commas (press Enter for default): ").strip()
-        symbols = [s.strip().upper() for s in symbol_input.split(',')] if symbol_input else DEFAULT_SYMGOLS
+        symbols = [s.strip().upper() for s in symbol_input.split(',')] if symbol_input else DEFAULT_SYMBOLS
 
     if not symbols:
         logging.error("No stock has been specified.")
