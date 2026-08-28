@@ -114,8 +114,18 @@ def main():
 
     # 🌟 従来のファイル名「scaler_{TARGET_MODE}.pkl」には、全銘柄のスケーラーを辞書形式で一括保存
     dict_scaler_path = os.path.join(SAVE_MODEL_DIR, f"scaler_{TARGET_MODE}.pkl")
+    # 💡 修正: 銘柄別辞書形式(現行仕様)が導入される前の、単一StandardScalerを
+    # そのまま保存していた旧形式のファイルが残っていると、existing_scalers.update()が
+    # 'StandardScaler' object has no attribute 'update' で必ず失敗していた。
+    # 辞書形式かどうかを確認し、辞書でなければ「実質的に存在しない」ものとして扱い、
+    # 新規の辞書で上書きする(旧形式のファイルは事前にjoblib.load()できているため、
+    # 中身を保持したい場合は事前にリネームしてバックアップを取っておくこと)。
     if os.path.exists(dict_scaler_path):
         existing_scalers = joblib.load(dict_scaler_path)
+        if not isinstance(existing_scalers, dict):
+            print(f"⚠️ {dict_scaler_path} は銘柄別辞書形式ではありません(旧形式の可能性)。"
+                  f"新しい辞書で上書きします。")
+            existing_scalers = {}
         existing_scalers.update(scalers_dict)
         joblib.dump(existing_scalers, dict_scaler_path)
         print("\n" + "="*50)
