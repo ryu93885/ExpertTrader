@@ -36,6 +36,12 @@ os.makedirs(LOG_DIR, exist_ok=True)
 INTERVAL_CONFIG = {"short": 5 * 60, "medium": 15 * 60, "long": 4 * 60 * 60}
 MAGIC_NUMBER = 20260626
 MIN_RR_RATIO = 1.5  # portfolio_env.py の学習時ロジックと一致させる最低リスクリワード比
+# 💡 サーキットブレーカー: self.recent_losses[sym](銘柄別の直近連敗数、0.9倍/サイクルで減衰)が
+# この値以上になったら、その銘柄への新規エントリーを一時停止する。3.0は概ね「短期間に3〜4回
+# 連敗した状態」に相当し、実際のテストトレードで見られたGBPJPY等の高速な同方向再エントリー連敗
+# (最大22連敗)を早期に遮断することを狙っている。値が下がれば(勝ちの有無に関わらず時間経過で
+# 自然減衰する)自動的に再開する。
+CIRCUIT_BREAKER_THRESHOLD = 3.0
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -323,6 +329,12 @@ class PortfolioFXTradingBot:
             current_pos = self._get_current_position(sym)
             if current_pos != 0.0:
                 logger.debug(f"[{sym}] 既存ポジション保持中。AIの新規判断をスキップし、TP/SLに任せます。")
+                continue
+
+            # 💡 サーキットブレーカー: 直近連敗数が閾値以上の銘柄は新規エントリーを見送る
+            loss_streak = self.recent_losses.get(sym, 0.0)
+            if loss_streak >= CIRCUIT_BREAKER_THRESHOLD:
+                logger.warning(f"🛑 [{sym}] サーキットブレーカー作動中(直近連敗数: {loss_streak:.2f})。新規エントリーを見送ります。")
                 continue
 
             act_direction = float(action[i*3])
