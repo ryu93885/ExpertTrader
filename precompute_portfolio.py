@@ -8,7 +8,7 @@ import logging
 from tqdm import tqdm
 
 from portfolio_dataset import PortfolioFXDataset
-from model import MultimodalFXmodel
+from model import MultimodalFXmodel, SYMBOL_TO_ID
 
 logging.basicConfig(level=logging.INFO,format = "%(asctime)s [%(levelname)s] %(message)s")
 def collate_fn_drop_none(batch):
@@ -68,8 +68,11 @@ def main():
             for i,sym in enumerate(symbols):
                 sym_imgs = imgs_batch[:,i,:,:,:].to(device)
                 sym_tabs = tabs_batch[:,i,:,:].to(device)
+                # 💡 B案: 銘柄埋め込み用のID。バッチ内の全サンプルがこの銘柄なので、
+                # 同じIDをバッチサイズ分並べる(学習側dataset.pyと同じSYMBOL_TO_IDを使用)。
+                sym_ids = torch.full((sym_imgs.shape[0],), SYMBOL_TO_ID[sym], dtype=torch.long, device=device)
 
-                class_out,risk_out = model(sym_imgs,sym_tabs)
+                class_out,risk_out = model(sym_imgs,sym_tabs,sym_ids)
                 probs = torch.softmax(class_out,dim = 1).cpu().numpy()
                 risks = risk_out.cpu().numpy()
 

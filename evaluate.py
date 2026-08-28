@@ -70,9 +70,9 @@ def evaluate_single_model(model, loaders, device, risk_scalers):
                 if batch_data is None:
                     continue  # 空のバッチ（全滅ケース）は安全にスキップ
 
-                imgs, tabs, cls, risks = batch_data
-                imgs, tabs = imgs.to(device), tabs.to(device)
-                oc, ork = model(imgs, tabs)
+                imgs, tabs, cls, risks, symbol_ids = batch_data
+                imgs, tabs, symbol_ids = imgs.to(device), tabs.to(device), symbol_ids.to(device)
+                oc, ork = model(imgs, tabs, symbol_ids)
 
                 # 分類評価
                 probs = F.softmax(oc, dim=1)
@@ -207,7 +207,7 @@ def main():
         img_dir = f"images/{pair_name}/{args.mode}_MTF"
 
         try:
-            dataset = FXMultimodalDataset(csv_file=csv_file, img_dir=img_dir, seq_length=40)
+            dataset = FXMultimodalDataset(csv_file=csv_file, img_dir=img_dir, symbol=pair_name, seq_length=40)
         except FileNotFoundError as e:
             logging.warning(f"⚠️ スキップ: {pair_name} の評価データを登録できませんでした。原因: {e}")
             continue

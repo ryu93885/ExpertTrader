@@ -182,12 +182,12 @@ class ScaledFXDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        img, tab, cls, risk = self.dataset[idx]
+        img, tab, cls, risk, symbol_id = self.dataset[idx]
         if isinstance(risk, torch.Tensor):
             scaled_risk = (risk - self.mean) / self.std
         else:
             scaled_risk = torch.tensor((risk - self.mean) / self.std, dtype=torch.float32)
-        return img, tab, cls, scaled_risk
+        return img, tab, cls, scaled_risk, symbol_id
 
 def filter_valid_data(csv_path, img_dir):
     """
@@ -335,8 +335,8 @@ def main():
         current_img_dir = os.path.join("images",symbol,f"{args.mode}_MTF")
         try:
             
-            raw_tr_ds = FXMultimodalDataset(tmp_train_csv, current_img_dir,seq_length=SEQ_LENGTH)
-            raw_val_ds = FXMultimodalDataset(tmp_val_csv, current_img_dir,seq_length=SEQ_LENGTH)
+            raw_tr_ds = FXMultimodalDataset(tmp_train_csv, current_img_dir, symbol=symbol, seq_length=SEQ_LENGTH)
+            raw_val_ds = FXMultimodalDataset(tmp_val_csv, current_img_dir, symbol=symbol, seq_length=SEQ_LENGTH)
 
             if len(raw_tr_ds) > 0:
                 train_datasets.append(ScaledFXDataset(raw_tr_ds, risk_mean, risk_std))
@@ -450,13 +450,13 @@ def main():
         for batch_data in tqdm(train_loader,desc = f"Epoch {epoch+1}"):
             if batch_data is None:
                 continue
-            imgs,tabs,cls,risks = batch_data
-            imgs, tabs = imgs.to(device), tabs.to(device)
+            imgs,tabs,cls,risks,symbol_ids = batch_data
+            imgs, tabs, symbol_ids = imgs.to(device), tabs.to(device), symbol_ids.to(device)
             cls = (cls + 1).to(device).long() # -1,0,1 -> 0,1,2(SELL,HOLD,BUY)
             risks = risks.to(device).float().view(-1, 1)
 
             optimizer.zero_grad()
-            out_class, out_risk = model(imgs, tabs)
+            out_class, out_risk = model(imgs, tabs, symbol_ids)
 
             loss_c = criterion_class(out_class, cls)
             loss_r = criterion_risk(out_risk, risks)
@@ -486,11 +486,11 @@ def main():
             for batch_data in val_loader:
                 if batch_data is None:
                     continue
-                imgs,tabs,cls,risks = batch_data
-                imgs, tabs = imgs.to(device), tabs.to(device)
+                imgs,tabs,cls,risks,symbol_ids = batch_data
+                imgs, tabs, symbol_ids = imgs.to(device), tabs.to(device), symbol_ids.to(device)
                 cls = (cls + 1).to(device).long()
                 risks = risks.to(device).float().view(-1, 1)
-                oc, ork = model(imgs, tabs)
+                oc, ork = model(imgs, tabs, symbol_ids)
 
                 loss_c = criterion_class(oc, cls)
                 loss_r = criterion_risk(ork, risks)
