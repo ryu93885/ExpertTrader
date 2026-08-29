@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 import logging
 from stable_baselines3 import SAC
@@ -16,11 +17,20 @@ def setup_logger():
 
 def main():
     setup_logger()
-    logging.info("portfolio_portfolio_rl.py ver208.2")
-    
+    logging.info("portfolio_portfolio_rl.py ver208.3")
+
+    # 💡 修正: mode がCLI引数化されておらず常に"short"固定だったため、mediumモードで
+    # 運用していても PortfolioFXDataset が images/{symbol}/short_MTF/ を探しに行き、
+    # 画像が見つからず全銘柄・全ステップが黒画像(ゼロテンソル)にすり替わったまま
+    # 気づかれずに学習が進んでしまう(例外を握りつぶすフォールバックがあるため)
+    # 事故があった。precompute_portfolio.py等と同じく --mode を明示指定できるようにする。
+    parser = argparse.ArgumentParser(description="ポートフォリオRL(SAC)の学習")
+    parser.add_argument("--mode", type=str, default="short", choices=["short", "medium", "long"], help="対象モード")
+    args = parser.parse_args()
+
     # 1. 基本設定
     symbols = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
-    mode = "short"
+    mode = args.mode
     merged_csv = "portfolio_merged_data_train_with_preds.csv"
     img_dir = "images"
     

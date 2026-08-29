@@ -3,8 +3,9 @@ import numpy as np
 import os
 import glob
 import logging
- 
- 
+import argparse
+
+
 def setup_logger():
     logging.basicConfig(level=logging.INFO,format = "%(asctime)s [%(levelname)s] %(message)s")
  
@@ -139,5 +140,15 @@ def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "
  
  
 if __name__ == "__main__":
-    merge_portfolio_data(phase = "train")
-    merge_portfolio_data(phase = "test")
+    # 💡 修正: mode を指定するCLI引数がなく、常に関数のデフォルト値(mode="short")で
+    # 実行されていたため、mediumモードのみで運用している場合、split_data.py側で
+    # mediumモードのデータを揃えても、ここで short モードの(存在しない)ファイルを
+    # 探しに行ってしまい、"指定されたディレクトリが見つかりません" で無言のまま
+    # 処理が止まっていた。他のスクリプト(precompute_portfolio.py等)と同じく
+    # --mode を明示的に指定できるようにする。
+    parser = argparse.ArgumentParser(description="ポートフォリオ用のデータ統合")
+    parser.add_argument("--mode", type=str, default="short", choices=["short", "medium", "long"], help="対象モード")
+    args = parser.parse_args()
+
+    merge_portfolio_data(mode=args.mode, phase = "train")
+    merge_portfolio_data(mode=args.mode, phase = "test")

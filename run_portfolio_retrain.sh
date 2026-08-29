@@ -13,7 +13,11 @@
 #
 set -euo pipefail
 
-MODE="short"
+# 💡 修正: 以前は "short" 固定で、mediumモード運用時に merge_portfolio_data.py /
+# train_portfolio_rl.py がmode引数を渡せず(常に内部デフォルトのshortを使ってしまい)、
+# 画像パスの不一致等が無言で発生する原因になっていた。実際に使用しているモードに
+# 合わせてここを変更してください。
+MODE="medium"
 BACKUP_DIR="saved_rl_models/_backup_before_fix_$(date +%Y%m%d_%H%M%S)"
 
 echo "=== 既存のポートフォリオRLモデルを退避 ==="
@@ -38,7 +42,7 @@ fi
 
 echo ""
 echo "=== 1/3: データ統合 (merge_portfolio_data.py) ==="
-python merge_portfolio_data.py
+python merge_portfolio_data.py --mode "$MODE"
 
 echo ""
 echo "=== 2/4: アナライザ推論結果の事前計算 - train (precompute_portfolio.py) ==="
@@ -50,7 +54,7 @@ python precompute_portfolio.py --phase test --mode "$MODE"
 
 echo ""
 echo "=== 4/4: ポートフォリオRL(SAC)の学習 (train_portfolio_rl.py) ==="
-python train_portfolio_rl.py
+python train_portfolio_rl.py --mode "$MODE"
 
 echo ""
 echo "=== 完了 ==="
