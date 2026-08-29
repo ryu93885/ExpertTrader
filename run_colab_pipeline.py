@@ -48,7 +48,9 @@ def main():
     # 1. 必要なライブラリのインストール
     # Colabにデフォルトで入っていないものを追加します
     print("\n📦 パッケージをインストールしています...")
-    run_command("pip install stable-baselines3 gymnasium mplfinance")
+    # 💡 sac_grad_clip.py の SACWithGradClip が stable-baselines3==2.9.0 の
+    # SAC.train()実装に依存しているため、バージョンを固定している。
+    run_command("pip install stable-baselines3==2.9.0 gymnasium mplfinance")
 
     # 2. 必要なディレクトリの作成
     dirs = ["images", "labeled_data", "saved_model", "saved_rl_models", "sac_portfolio_tensorboard"]

@@ -12,7 +12,11 @@ Pillow
 torch
 torchvision
 gymnasium
-stable-baselines3
+# 💡 sac_grad_clip.py の SACWithGradClip は SAC.train() の内部ロジックを
+# 忠実に複製した上で勾配クリッピングを追加したサブクラスであるため、
+# stable-baselines3 のバージョンを固定している。バージョンを上げる場合は
+# sac_grad_clip.py を新しい SAC.train() の実装に追従させてから変更すること。
+stable-baselines3==2.9.0
 optuna
 mplfinance
 matplotlib
