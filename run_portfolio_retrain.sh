@@ -36,8 +36,18 @@ do
     moved=1
   fi
 done
+# 💡 追加: train_portfolio_rl.py は完了済みモデルが無い場合、途中保存の
+# チェックポイント(saved_rl_models/checkpoints/)から最新のものを自動的に
+# 読み込んで再開する。完了済みモデルだけ退避してチェックポイントを残すと、
+# 「新規学習のつもり」が実際には古い(発散した可能性のある)途中保存から
+# 再開されてしまうため、こちらもまとめて退避する。
+if [ -d "saved_rl_models/checkpoints" ] && [ -n "$(ls -A saved_rl_models/checkpoints 2>/dev/null)" ]; then
+  mv "saved_rl_models/checkpoints" "$BACKUP_DIR/checkpoints"
+  echo "  退避: saved_rl_models/checkpoints/ -> $BACKUP_DIR/checkpoints/"
+  moved=1
+fi
 if [ "$moved" -eq 0 ]; then
-  echo "  (退避対象の既存モデルは見つかりませんでした。新規学習として開始します)"
+  echo "  (退避対象の既存モデル・チェックポイントは見つかりませんでした。新規学習として開始します)"
 fi
 
 echo ""
