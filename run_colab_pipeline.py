@@ -4,7 +4,12 @@ import os
 import shutil
 from datetime import datetime
 
-MODE = "short"
+# 💡 修正: mediumモードのみで運用しているため、shortのまま残っていると
+# merge_portfolio_data.py / train_portfolio_rl.py に --mode が渡らず(後述)、
+# 存在しないshortモードのデータ・画像を参照してしまう(train_portfolio_rl.py側は
+# 画像読み込み失敗を握りつぶすフォールバックがあるため、エラーにならず黒画像で
+# 学習が進んでしまう)。実際に使用しているモードに合わせて変更してください。
+MODE = "medium"
 
 def run_command(command):
     print(f"🚀 実行中: {command}")
@@ -57,7 +62,7 @@ def main():
     # 3. データ統合プログラムの実行 (Source 47 相当)
     # ※事前に labeled_data ディレクトリにCSVを配置しておく必要があります
     print("\n🔄 データの結合処理を開始します...")
-    run_command("python merge_portfolio_data.py")
+    run_command(f"python merge_portfolio_data.py --mode {MODE}")
 
     # 4-0. 強化学習で使用する推論結果を作成する(train/testの両フェーズ)
     # 💡 修正: testフェーズも実行しないと、学習後に test_portfolio.py で
@@ -70,7 +75,7 @@ def main():
 
     # 4. 強化学習 (SAC) の実行 (Source 46 相当)
     print("\n🧠 SACエージェントの強化学習を開始します...")
-    run_command("python train_portfolio_rl.py")
+    run_command(f"python train_portfolio_rl.py --mode {MODE}")
 
     print("\n🎉 全ての学習プロセスが正常に完了しました！")
     print(f"👉 出力された 'saved_rl_models/sac_portfolio_agent_{MODE}.zip' と 'saved_rl_models/vec_normalize.pkl' をダウンロードし、Windows環境のBot(portfolio_trading_bot.py)で利用してください。")
