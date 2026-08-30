@@ -10,6 +10,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv,VecNormalize
 
 from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv
+from rl_checkpoint_utils import resolve_model_paths
 
 def setup_logger():
     logging.basicConfig(level = logging.INFO,format = "%(asctime)s [%(levelname)s] %(message)s")
@@ -33,10 +34,14 @@ def main():
     test_csv = "portfolio_merged_data_test_with_preds.csv"
     img_dir = "images"
 
-    # 💡 修正: 実際の保存ファイル名(train_portfolio_rl.py)には mode サフィックスが
-    # 付いており、旧コードの "sac_portfolio_agent.zip" では常に見つからなかった。
-    rl_model_path = f"saved_rl_models/sac_portfolio_agent_{args.mode}.zip"
-    vec_norm_path = "saved_rl_models/vec_normalize.pkl"
+    rl_model_path, vec_norm_path, _replay_buffer_path, model_source = resolve_model_paths(args.mode)
+    if rl_model_path is None:
+        logging.error(
+            "❌ SACモデルが見つかりません(完了済みモデル・Drive上のコピー・"
+            "途中保存のいずれも見つかりませんでした)。学習が完了しているか確認してください。"
+        )
+        return
+    logging.info(f"📦 使用するモデル: {model_source} ({rl_model_path})")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device:{device}")
@@ -62,23 +67,14 @@ def main():
     env = PortfolioFXEnv(dataset = dataset,symbols = args.symbols)
     vec_env = DummyVecEnv([lambda:env])
 
-    if os.path.exists(vec_norm_path):
-        vec_env = VecNormalize.load(vec_norm_path,vec_env)
-
-        vec_env.training = False
-        vec_env.norm_reward = False
-        logging.info("✅ VecNormalize の統計情報（平均・分散）をロードし、推論モードに設定しました。")
-    else:
-        logging.error(f"❌ {vec_norm_path} が見つかりません。学習が完了しているか確認してください。")
-        return
+    vec_env = VecNormalize.load(vec_norm_path,vec_env)
+    vec_env.training = False
+    vec_env.norm_reward = False
+    logging.info("✅ VecNormalize の統計情報（平均・分散）をロードし、推論モードに設定しました。")
 
     #SACエージェントのロード
-    if os.path.exists(rl_model_path):
-        model = SAC.load(rl_model_path,device = device)
-        logging.info("✅ SACエージェントをロードしました。")
-    else:
-        logging.error("❌ SACモデルが見つかりません。")
-        return 
+    model = SAC.load(rl_model_path,device = device)
+    logging.info("✅ SACエージェントをロードしました。")
 
 
 
@@ -93,6 +89,8 @@ def main():
     step_count = 0
 
 
+    done_reason = None
+
     while not done:
         action,_states = model.predict(obs,deterministic=True)
         obs,rewards,dones,infos = vec_env.step(action)
@@ -106,8 +104,37 @@ def main():
         step_count += 1
         if step_count % 100 == 0:
             logging.info(f"Step {step_count:04d} | Equity: {info['equity']:,.0f} 円 | Balance: {info['balance']:,.0f} 円")
+            # 💡 追加: 銘柄別の建玉・価格・実現/含み損益を出力する。
+            # 資産の急変(急騰・急落)がどの銘柄に由来するかを確認するため。
+            positions = info.get("positions", {})
+            prices = info.get("prices", {})
+            unrealized = info.get("unrealized_pnl_by_symbol", {})
+            realized = info.get("realized_pnl_by_symbol", {})
+            for sym in positions:
+                pos = positions[sym]
+                r_pnl = realized.get(sym, 0.0)
+                if pos != 0 or r_pnl != 0:
+                    logging.info(
+                        f"    [{sym}] pos={pos:+.2f}lot 価格={prices.get(sym, 0):.3f} "
+                        f"含み損益={unrealized.get(sym, 0):,.0f}円 直近の実現損益={r_pnl:,.0f}円"
+                    )
+
+        if done:
+            done_reason = info.get("done_reason")
 
 
+    # 💡 追加: バックテストが「テスト期間を最後まで走り切った」のか「途中で資産が
+    # 初期資金の50%を下回って強制終了した」のかを明示する。データセット全体の
+    # 行数と実際に走ったステップ数を突き合わせることで、破産による早期終了を
+    # 見落とさないようにする。
+    logging.info(f"🏁 テスト終了(総ステップ数: {step_count} / テストデータ行数: {len(dataset)} / 終了理由: {done_reason})")
+    if done_reason == "bankruptcy":
+        logging.warning(
+            "⚠️ 資産が初期資金の50%を下回ったため、テスト期間を最後まで走り切れずに"
+            "シミュレーションが強制終了しました。"
+        )
+
+    #結果の評価と可視化
     #結果の評価と可視化
     try:
         plt.figure(figsize=(12,6))
