@@ -35,24 +35,6 @@ def setup_logger():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 
-def find_latest_checkpoint(checkpoint_dirs, mode):
-    """
-    途中保存されたモデル本体(.zip)の中から、最もステップ数が大きいものを探す。
-    複数の保存先候補(Drive・ローカル)をまたいで検索し、無ければNoneを返す。
-    """
-    best_path, best_steps = None, -1
-    for d in checkpoint_dirs:
-        pattern = os.path.join(d, f"sac_portfolio_agent_{mode}_*_steps.zip")
-        for path in glob.glob(pattern):
-            m = re.search(r"_(\d+)_steps\.zip$", path)
-            if not m:
-                continue
-            steps = int(m.group(1))
-            if steps > best_steps:
-                best_path, best_steps = path, steps
-    return best_path
-
-
 def main():
     setup_logger()
     logging.info("portfolio_portfolio_rl.py ver210.0")
