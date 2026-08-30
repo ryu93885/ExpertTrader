@@ -13,6 +13,7 @@ from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv
 from model import MultimodalFXmodel  # 既存のアナライザモデル
 from sac_grad_clip import SACWithGradClip
+from rl_checkpoint_utils import get_checkpoint_dirs,resolve_model_paths
 
 # 💡 学習率スケジュール: 固定値をトライ&エラーで探すのではなく、学習が進むにつれて
 # 自動的に更新幅を小さくしていく(SB3標準のLinearSchedule)。80万ステップ付近で
@@ -34,22 +35,6 @@ def setup_logger():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 
-def get_checkpoint_dirs():
-    """
-    途中保存の保存先候補ディレクトリを返す(先頭が実際の保存先、全体が復旧時の検索対象)。
-
-    Google Driveがマウントされていれば優先的にそちらへ保存する。Colabのローカル
-    ディスクはセッション切断(タイムアウト等)でVMごと失われることがあり、
-    ローカルに途中保存していても復旧できない場合があるため。
-    """
-    dirs = []
-    drive_dir = "/content/drive/MyDrive/FX_AI_Models/rl_checkpoints"
-    if os.path.exists("/content/drive/MyDrive"):
-        dirs.append(drive_dir)
-    dirs.append("saved_rl_models/checkpoints")
-    return dirs
-
-
 def find_latest_checkpoint(checkpoint_dirs, mode):
     """
     途中保存されたモデル本体(.zip)の中から、最もステップ数が大きいものを探す。
@@ -66,17 +51,6 @@ def find_latest_checkpoint(checkpoint_dirs, mode):
             if steps > best_steps:
                 best_path, best_steps = path, steps
     return best_path
-
-
-def checkpoint_companion_path(model_ckpt_path, checkpoint_type):
-    """
-    モデル本体のチェックポイントパスから、対応するvecnormalize/replay_bufferの
-    パスを組み立てる(CheckpointCallbackの命名規則: {prefix}_{type}{steps}_steps.{ext})。
-    """
-    m = re.match(r"^(.*)_(\d+)_steps\.zip$", os.path.basename(model_ckpt_path))
-    prefix, steps = m.group(1), m.group(2)
-    ext = "pkl"
-    return os.path.join(os.path.dirname(model_ckpt_path), f"{prefix}_{checkpoint_type}{steps}_steps.{ext}")
 
 
 def main():
@@ -144,54 +118,36 @@ def main():
 
     lr_schedule = LinearSchedule(start=LR_SCHEDULE_START, end=LR_SCHEDULE_END, end_fraction=LR_SCHEDULE_END_FRACTION)
 
-    if os.path.exists(f"{agent_save_path_base}.zip"):
-        # 正常完了(model.learn()を最後まで走らせて保存済み)のモデルがあれば最優先でロード
-        logging.info("既存の(完了済み)モデルを発見しました。")
-        vec_env = VecNormalize.load(vec_norm_path,vec_env)
+        # 💡 修正: 以前はローカルの完了済みモデルとローカル/Driveのチェックポイントしか
+    # 見ておらず、「Google Driveにコピーされた完了済みモデル」だけが存在するケース
+    # (ローカルディスクが失われたが、学習自体は完走してDriveにバックアップ済みの場合)
+    # を見落としていた。resolve_model_paths() で3種類の保存先を優先順位付きで検索する
+    # (test_portfolio.py と同じロジックを共有)。
+    resumed_model_path, resumed_vecnorm_path, resumed_replay_path, model_source = resolve_model_paths(mode)
+
+    if resumed_model_path is not None:
+        logging.info(f"既存のモデルを検出しました({model_source}): {resumed_model_path}")
+        vec_env = VecNormalize.load(resumed_vecnorm_path, vec_env)
         vec_env.training = True
         vec_env.norm_reward = True
 
-        model = SACWithGradClip.load(agent_save_path_base, env=vec_env, device=device, learning_rate=lr_schedule)
+        model = SACWithGradClip.load(resumed_model_path, env=vec_env, device=device, learning_rate=lr_schedule)
 
-        if os.path.exists(replay_buffer_path):
-            model.load_replay_buffer(replay_buffer_path)
+        if resumed_replay_path is not None and os.path.exists(resumed_replay_path):
+            model.load_replay_buffer(resumed_replay_path)
             logging.info("リプレイバッファを読み込みました")
         else:
+            # 💡 途中保存にはディスク容量節約のためreplay bufferを含めていないため、
+            # チェックポイントから再開する場合は空バッファから始まる。learning_starts分の
+            # ウォームアップ後すぐに通常通り学習が再開されるため、致命的な影響はない。
             logging.warning("リプレイバッファが見つかりません。新規メモリで再開します。")
     else:
-        latest_ckpt = find_latest_checkpoint(checkpoint_dirs, mode)
-        if latest_ckpt is not None:
-            # 完了済みモデルは無いが、セッション切断等で中断した際の途中保存が見つかった場合
-            logging.info(f"完了済みモデルは見つかりませんでしたが、中断時の途中保存を検出しました: {latest_ckpt}")
-            load_path = latest_ckpt[:-4]  # ".zip" を除去
-
-            vecnorm_ckpt_path = checkpoint_companion_path(latest_ckpt, "vecnormalize_")
-            if os.path.exists(vecnorm_ckpt_path):
-                vec_env = VecNormalize.load(vecnorm_ckpt_path, vec_env)
-                vec_env.training = True
-                vec_env.norm_reward = True
-            else:
-                logging.warning("途中保存のVecNormalize統計が見つかりません。新規の正規化統計で再開します。")
-
-            model = SACWithGradClip.load(load_path, env=vec_env, device=device, learning_rate=lr_schedule)
-
-            replay_ckpt_path = checkpoint_companion_path(latest_ckpt, "replay_buffer_")
-            if os.path.exists(replay_ckpt_path):
-                model.load_replay_buffer(replay_ckpt_path)
-                logging.info("途中保存のリプレイバッファを読み込みました")
-            else:
-                # 💡 ディスク容量節約のため途中保存ではreplay bufferを保存していない。
-                # バッファが空の状態から再開するが、learning_starts分のウォームアップ後
-                # すぐに通常通り学習が再開されるため、致命的な影響はない。
-                logging.warning("途中保存にリプレイバッファは含まれていません。新規メモリで再開します。")
-        else:
-            logging.info("🚀 新規モデルとしてSACエージェントの学習を開始します...")
-            model = SACWithGradClip(
-                "MlpPolicy", vec_env, verbose=1,
-                tensorboard_log="./sac_portfolio_tensorboard/",
-                learning_rate=lr_schedule,
-            )
-
+        logging.info("🚀 新規モデルとしてSACエージェントの学習を開始します...")
+        model = SACWithGradClip(
+            "MlpPolicy", vec_env, verbose=1,
+            tensorboard_log="./sac_portfolio_tensorboard/",
+            learning_rate=lr_schedule,
+        )
     checkpoint_callback = CheckpointCallback(
         save_freq=CHECKPOINT_SAVE_FREQ,
         save_path=checkpoint_save_dir,
