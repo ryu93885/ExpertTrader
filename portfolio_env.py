@@ -146,6 +146,9 @@ class PortfolioFXEnv(gym.Env):
         step_realized_pnl = 0.0
         unrealized_pnl_total = 0.0
         counterfactual_penalty = 0.0
+        per_symbol_realized_pnl = {sym: 0.0 for sym in self.symbols}
+        per_symbol_unrealized_pnl = {sym: 0.0 for sym in self.symbols}
+        per_symbol_price = {}
         row = self.dataset.df.iloc[self.current_step]
         base_tf = "M5" if self.dataset.mode == "short" else "M15" if self.dataset.mode == "medium" else "H4"
         tf = "M15" if self.dataset.mode == "short" else "H4" if self.dataset.mode == "medium" else "D1"
@@ -170,7 +173,7 @@ class PortfolioFXEnv(gym.Env):
             spread = row.get(f"{sym}_{base_tf}_spread_raw", 0.0002)
             atr = row.get(f"{sym}_{tf}_ATR_raw", current_close * 0.005)
             config = self.symbol_configs[sym]
-            
+            per_symbol_price[sym] = float(current_close)
             # 1. 既存ポジションのTP/SL判定
             if self.positions[sym] != 0:
                 is_closed = False
@@ -222,6 +225,7 @@ class PortfolioFXEnv(gym.Env):
                         converted_pnl = raw_pnl * (current_usdjpy_rate / current_usdcad_rate)
                         
                     step_realized_pnl += converted_pnl
+                    per_symbol_realized_pnl[sym] = converted_pnl
                     self.positions[sym] = 0.0
             
             # 2. 新規エントリー判定
@@ -271,11 +275,13 @@ class PortfolioFXEnv(gym.Env):
             if self.positions[sym] != 0:
                 raw_unrealized = (current_close - self.entry_prices[sym]) * self.positions[sym] * config["contract_size"]
                 if "JPY" in sym:
-                    unrealized_pnl_total += raw_unrealized
+                    converted_unrealized = raw_unrealized
                 elif "USD" in sym or "GOLD" in sym:
-                    unrealized_pnl_total += raw_unrealized * current_usdjpy_rate
+                    converted_unrealized = raw_unrealized * current_usdjpy_rate
                 else:
-                    unrealized_pnl_total += raw_unrealized
+                    converted_unrealized = raw_unrealized
+                unrealized_pnl_total += converted_unrealized
+                per_symbol_unrealized_pnl[sym] = converted_unrealized
 
         self.balance += step_realized_pnl
         self.equity = self.balance + unrealized_pnl_total
@@ -298,10 +304,13 @@ class PortfolioFXEnv(gym.Env):
 
         self.prev_equity = self.equity
         self.current_step += 1
-        done = self.current_step >= len(self.dataset) - 1
-        
-        if self.equity <= self.initial_balance * 0.5:
-            done = True
+        # 💡 修正: done=Trueになった理由(データ末尾到達 or 破産判定)を
+        # 切り分けて記録できるようにする(報酬・学習ロジック自体は変更していない。
+        # 従来通り両条件のどちらかでdone=True、破産時のみ-20.0のペナルティ)。
+        is_bankrupt = self.equity <= self.initial_balance * 0.5
+        done = (self.current_step >= len(self.dataset) - 1) or is_bankrupt
+
+        if is_bankrupt:
             reward -= 20.0
 
         drawdown_ratio = max(0.0,(self.high_water_mark - self.equity) / self.high_water_mark)
@@ -315,5 +324,20 @@ class PortfolioFXEnv(gym.Env):
         if next_obs is None:
             next_obs = np.zeros(self.observation_space.shape, dtype=np.float32)
 
-        info = {"equity": self.equity, "balance": self.balance}
+        # 💡 追加: 銘柄別の建玉・実現/含み損益・価格と、done時の理由をinfoに追加。
+        # train_portfolio_rl.py側はこれらのキーを参照しないため、学習ロジック・
+        # 報酬計算には一切影響しない(test_portfolio.py の診断ログ強化用)。
+        done_reason = None
+        if done:
+            done_reason = "bankruptcy" if is_bankrupt else "end_of_data"
+
+        info = {
+            "equity": self.equity,
+            "balance": self.balance,
+            "positions": dict(self.positions),
+            "realized_pnl_by_symbol": per_symbol_realized_pnl,
+            "unrealized_pnl_by_symbol": per_symbol_unrealized_pnl,
+            "prices": per_symbol_price,
+            "done_reason": done_reason,
+        }
         return next_obs, reward, done, False, info
