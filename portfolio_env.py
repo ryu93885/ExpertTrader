@@ -83,6 +83,10 @@ class PortfolioFXEnv(gym.Env):
             # ランダムな開始位置の決定（学習時のみ）
             safe_max_start = len(self.dataset) - 1000
             self.current_step = np.random.randint(self.dataset.seq_length, max(safe_max_start, self.dataset.seq_length + 1))
+
+        while obs is None and self.current_step < len(self.dataset) - 1:
+            self.current_step += 1
+            obs = self._get_observation()
         
         obs = self._get_observation()
             
