@@ -17,7 +17,7 @@ class PortfolioFXEnv(gym.Env):
     7銘柄同時並行トレード環境（Action Space: 21次元）
     1つの口座資金を共有し、相関関係を利用したヘッジトレードを学習する
     """
-    def __init__(self, dataset,symbols, initial_balance=10000000):
+    def __init__(self, dataset,symbols, initial_balance=10000000,fixed_start = False):
         super(PortfolioFXEnv, self).__init__()
         logging.info("PortfolioFXEnv: 21-Action Multi-Asset Initialization")
         logging.info("portfolio_env.py ver209.0")
@@ -28,7 +28,8 @@ class PortfolioFXEnv(gym.Env):
         self.num_symbols = len(symbols)
         
         self.initial_balance = initial_balance
-        
+
+        self.fixed_start = fixed_start
         # 銘柄ごとの設定値（コントラクトサイズやポイントバリュー）
         # 💡 修正: 旧ロジックは "USDJPY" or "EUR" を含むかどうかだけで判定しており、
         # GBPUSD/AUDUSD/GBPJPY が誤ってGOLDと同じ扱い(contract_size=100)になっていた。
@@ -75,13 +76,15 @@ class PortfolioFXEnv(gym.Env):
         self.reset_env_variables()
         
         # ランダムな開始位置の決定
-        safe_max_start = len(self.dataset) - 1000
-        self.current_step = np.random.randint(self.dataset.seq_length, max(safe_max_start, self.dataset.seq_length + 1))
+        if self.fixed_start:
+            # テスト実行間で同じ期間を比較できるよう、常にデータ先頭から開始する
+            self.current_step = self.dataset.seq_length
+        else:
+            # ランダムな開始位置の決定（学習時のみ）
+            safe_max_start = len(self.dataset) - 1000
+            self.current_step = np.random.randint(self.dataset.seq_length, max(safe_max_start, self.dataset.seq_length + 1))
         
         obs = self._get_observation()
-        while obs is None and self.current_step < len(self.dataset) - 1:
-            self.current_step += 1
-            obs = self._get_observation()
             
         return obs, {"equity": self.equity}
 
