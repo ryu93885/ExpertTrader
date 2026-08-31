@@ -3,7 +3,7 @@ from gymnasium import spaces
 import numpy as np
 import logging
 
-NEW_HIGH_BONUS_COEF = 50.0
+NEW_HIGH_BONUS_COEF = 2.0
 DRAWDOWN_PENALTY_COEF = 40.0
 REALIZED_PNL_WEIGHT = 1.0
 UNREALIZED_PNL_WEIGHT = 0.2
@@ -237,8 +237,16 @@ class PortfolioFXEnv(gym.Env):
                 sl_multiplier = 1.0 + (act_sl + 1.0)
                 sl_dist = atr * sl_multiplier
                 
-                if sl_dist > 0:
-                    raw_lot = risk_amount / (sl_dist * config["contract_size"])
+                if "JPY" in sym:
+                    sl_dist_jpy = sl_dist
+                elif sym == "USDCAD":
+                    current_usdcad_rate = row.get(f"USDCAD_{tf}_close_raw", 1.35)
+                    sl_dist_jpy = sl_dist * (current_usdjpy_rate / current_usdcad_rate)
+                else:
+                    sl_dist_jpy = sl_dist * current_usdjpy_rate
+
+                if sl_dist_jpy > 0:
+                    raw_lot = risk_amount / (sl_dist_jpy * config["contract_size"])
                     target_lot = round(max(0.01, min(raw_lot, 5.0)), 2)
                 else:
                     target_lot = 0.01
