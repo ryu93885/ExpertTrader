@@ -84,12 +84,13 @@ class PortfolioFXEnv(gym.Env):
             safe_max_start = len(self.dataset) - 1000
             self.current_step = np.random.randint(self.dataset.seq_length, max(safe_max_start, self.dataset.seq_length + 1))
 
+        obs = self._get_observation()
+                    
         while obs is None and self.current_step < len(self.dataset) - 1:
             self.current_step += 1
             obs = self._get_observation()
         
-        obs = self._get_observation()
-            
+        
         return obs, {"equity": self.equity}
 
     def _get_observation(self):
