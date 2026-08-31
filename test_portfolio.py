@@ -64,7 +64,7 @@ def main():
     # 使われていなかった(死んだコード)ため、丸ごと削除した。
 
     #テスト用環境の構築とvecnormalizeの復元
-    env = PortfolioFXEnv(dataset = dataset,symbols = args.symbols)
+    env = PortfolioFXEnv(dataset = dataset,symbols = args.symbols,fixed_start=True)
     vec_env = DummyVecEnv([lambda:env])
 
     vec_env = VecNormalize.load(vec_norm_path,vec_env)
@@ -102,7 +102,7 @@ def main():
         balances.append(info["balance"])
 
         step_count += 1
-        if step_count % 100 == 0:
+        if step_count % 10 == 0:
             logging.info(f"Step {step_count:04d} | Equity: {info['equity']:,.0f} 円 | Balance: {info['balance']:,.0f} 円")
             # 💡 追加: 銘柄別の建玉・価格・実現/含み損益を出力する。
             # 資産の急変(急騰・急落)がどの銘柄に由来するかを確認するため。
