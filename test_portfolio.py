@@ -4,7 +4,7 @@ import logging
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
-
+import datetime
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv,VecNormalize
 
@@ -12,12 +12,26 @@ from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv
 from rl_checkpoint_utils import resolve_model_paths
 
-def setup_logger():
-    logging.basicConfig(level = logging.INFO,format = "%(asctime)s [%(levelname)s] %(message)s")
+DRIVE_TEST_RESULTS_DIR = "/content/drive/MyDrive/FX_AI_Models/test_results"
+LOCAL_TEST_RESULTS_DIR = "test_results"
+
+
+def get_test_results_dir():
+    if os.path.exists("/content/drive/MyDrive"):
+        results_dir = DRIVE_TEST_RESULTS_DIR
+    else:
+        results_dir = LOCAL_TEST_RESULTS_DIR
+    os.makedirs(results_dir, exist_ok=True)
+    return results_dir
+
+
+def setup_logger(log_file_path=None):
+    handlers = [logging.StreamHandler()]
+    if log_file_path is not None:
+        handlers.append(logging.FileHandler(log_file_path, encoding="utf-8"))
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=handlers)
 
 def main():
-    setup_logger()
-    logging.info("test_portfolio.py ver209.0")
     parser = argparse.ArgumentParser("test portfolio rl model")
     # 💡 修正: 実際に学習・precompute_portfolio.py/merge_portfolio_data.py で使われている
     # 7銘柄・並び順(portfolio_trading_bot.py の TARGET_SYMBOLS と完全一致)に修正。
@@ -25,6 +39,23 @@ def main():
     parser.add_argument("--symbols",default=["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"])
     parser.add_argument("--mode",default = "short",help = "モード選択",choices = ["short","medium","long"])
     args = parser.parse_args()
+
+    # 💡 追加: ログファイル・グラフの保存先を先に決定してからロガーを初期化することで、
+    # 以降の全ログ出力(モデルロード状況・ステップごとの資産推移など)がファイルにも残る。
+    results_dir = get_test_results_dir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_path = os.path.join(results_dir, f"test_portfolio_{args.mode}_{timestamp}.log")
+    setup_logger(log_file_path)
+
+    logging.info("test_portfolio.py ver209.1")
+    if results_dir == DRIVE_TEST_RESULTS_DIR:
+        logging.info(f"Google Driveを検出。テスト結果の保存先をDriveに設定します: {results_dir}")
+    else:
+        logging.warning(
+            "Google Driveが未マウントのため、テスト結果はColabのローカルディスクに保存されます。"
+            "セッション切断でVMごと失われる可能性があるので注意してください。"
+        )
+    logging.info(f"📝 ログをファイルにも保存します: {log_file_path}")
     # 💡 修正: PortfolioFXEnv は prob_0/1/2・risk_val 列を必要とするが、
     # これらは precompute_portfolio.py --phase test で追加された
     # "_with_preds" 付きファイルにしか存在しない。"_with_preds" の付かない
@@ -147,7 +178,7 @@ def main():
         plt.grid(True,alpha = 0.3)
         plt.tight_layout()
 
-        save_path = "portfolio_test_result.png"
+        save_path = os.path.join(results_dir, f"portfolio_test_result_{args.mode}_{timestamp}.png")
         plt.savefig(save_path)
         logging.info(f"🖼️ 資産推移のグラフを保存しました: {save_path}")
     except Exception as e:
