@@ -49,10 +49,16 @@ UNREALIZED_PNL_WEIGHT = 0.2
 MIN_RR_RATIO = 1.5
 CONSECUTIVE_LOSS_PENALTY_COEF = 0.5
 COUNTERFACTUAL_PENALTY_COEF = 1.0
-if self.equity > self.high_water_mark:
-reward += (self.equity - self.high_water_mark)/self.initial_balance * 100 * NEW_HIGH_BONUS_COEF
+```
 
-###修正後プログラム
+```python
+        if self.equity > self.high_water_mark:
+            reward += (self.equity - self.high_water_mark)/self.initial_balance * 100 * NEW_HIGH_BONUS_COEF
+```
+
+### 修正後のプログラム
+
+```python
 NEW_HIGH_BONUS_COEF = 2.0
 NEW_HIGH_BONUS_MAX = 5.0  # 💡 追加: 1ステップあたりの上限。資産急騰時に他の報酬項目より
                           # 桁違いに大きくなり、criticの学習を不安定化させていた可能性への対策。
@@ -62,14 +68,22 @@ UNREALIZED_PNL_WEIGHT = 0.2
 MIN_RR_RATIO = 1.5
 CONSECUTIVE_LOSS_PENALTY_COEF = 0.5
 COUNTERFACTUAL_PENALTY_COEF = 1.0
-
-if self.equity > self.high_water_mark:
- new_high_bonus = (self.equity - self.high_water_mark)/self.initial_balance * 100 * NEW_HIGH_BONUS_COEF
- reward += min(new_high_bonus, NEW_HIGH_BONUS_MAX)
 ```
 
-資産急騰時の報酬の突出を抑えることで、VecNormalizeの正規化が追従しやすくなり、
-criticのTDターゲットの不連続(≒ critic_lossの急上昇)が緩和されることを期待する
-ボーナス自体は残すため、「新高値を更新する」という行動へのインセンティブは維持される
-この修正のみで崩壊が再発しない場合、報酬関数側の要因が支配的だったと判断できる
-崩壊が再発する場合は、次のステップとして #002(entropy下限のクランプ、sac_grad_clip.py)を検討する
+```python
+        if self.equity > self.high_water_mark:
+            new_high_bonus = (self.equity - self.high_water_mark)/self.initial_balance * 100 * NEW_HIGH_BONUS_COEF
+            reward += min(new_high_bonus, NEW_HIGH_BONUS_MAX)
+```
+
+### 期待される効果
+
+- 資産急騰時の報酬の突出を抑えることで、VecNormalizeの正規化が追従しやすくなり、
+  criticのTDターゲットの不連続(≒ critic_lossの急上昇)が緩和されることを期待する
+- ボーナス自体は残すため、「新高値を更新する」という行動へのインセンティブは維持される
+- この修正のみで崩壊が再発しない場合、報酬関数側の要因が支配的だったと判断できる
+- 崩壊が再発する場合は、次のステップとして #002(entropy下限のクランプ、sac_grad_clip.py)を検討する
+
+### 検証結果
+
+(次回の学習・テスト完了後に追記)
