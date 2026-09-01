@@ -15,7 +15,8 @@
 
 | # | 日付 | 対象ファイル | 概要 | ステータス |
 |---|---|---|---|---|
-| 001 | 2026-09-01 | portfolio_env.py | 資産最高値ボーナス(NEW_HIGH_BONUS_COEF)に上限を設定 | 未検証 |
+| 002 | 2026-09-01 | sac_grad_clip.py | entropy係数(ent_coef)の下限を0.01に設定 | 未検証 |
+| 001 | 2026-09-01 | portfolio_env.py | 資産最高値ボーナス(NEW_HIGH_BONUS_COEF)に上限を設定 | 一部効果あり(critic_loss急上昇は再発せず。ただしentropy崩壊は継続) |
 
 ---
 
@@ -86,11 +87,7 @@ COUNTERFACTUAL_PENALTY_COEF = 1.0
 
 ### 検証結果
 
-
-| # | 日付 | 対象ファイル | 概要 | ステータス |
-|---|---|---|---|---|
-| 002 | 2026-09-01 | sac_grad_clip.py | entropy係数(ent_coef)の下限を0.01に設定 | 未検証 |
-| 001 | 2026-09-01 | portfolio_env.py | 資産最高値ボーナス(NEW_HIGH_BONUS_COEF)に上限を設定 | 一部効果あり(critic_loss急上昇は再発せず。ただしentropy崩壊は継続) |
+(次回の学習・テスト完了後に追記)
 
 
 ---
