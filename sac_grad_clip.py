@@ -19,7 +19,7 @@ from torch.nn import functional as F
 # 異常な外れ値バッチによる大暴走だけを防ぐ」ための緩めの安全弁として機能する。
 # このため厳密な最適値探索は不要で、10.0という一般的な値を採用している。
 GRAD_CLIP_MAX_NORM = 10.0
-
+ENT_COEF_MIN = 0.01
 
 class SACWithGradClip(SAC):
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
@@ -45,7 +45,10 @@ class SACWithGradClip(SAC):
 
             ent_coef_loss = None
             if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
-                ent_coef = torch.exp(self.log_ent_coef.detach())
+                # 💡 追加: exp()適用後の値をENT_COEF_MINでクランプする。
+                # ent_coef_loss自体は元のlog_ent_coef(クランプ前)で計算するため、
+                # auto-tuningの勾配計算そのものは変更しない。
+                ent_coef = torch.clamp(torch.exp(self.log_ent_coef.detach()), min=ENT_COEF_MIN)
                 ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
                 ent_coef_losses.append(ent_coef_loss.item())
             else:
@@ -57,6 +60,12 @@ class SACWithGradClip(SAC):
                 self.ent_coef_optimizer.zero_grad()
                 ent_coef_loss.backward()
                 self.ent_coef_optimizer.step()
+                # 💡 追加: log_ent_coef(学習対象パラメータ)自体もENT_COEF_MINに
+                # 対応する下限でクランプする。exp後の値だけをクランプすると
+                # パラメータ自体は際限なく下がり続け、Adamのモーメンタムが
+                # 偏った状態のままになるため、パラメータそのものを制限する。
+                with torch.no_grad():
+                    self.log_ent_coef.data.clamp_(min=math.log(ENT_COEF_MIN))
 
             with torch.no_grad():
                 next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
