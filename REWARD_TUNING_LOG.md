@@ -86,4 +86,112 @@ COUNTERFACTUAL_PENALTY_COEF = 1.0
 
 ### 検証結果
 
+
+| # | 日付 | 対象ファイル | 概要 | ステータス |
+|---|---|---|---|---|
+| 002 | 2026-09-01 | sac_grad_clip.py | entropy係数(ent_coef)の下限を0.01に設定 | 未検証 |
+| 001 | 2026-09-01 | portfolio_env.py | 資産最高値ボーナス(NEW_HIGH_BONUS_COEF)に上限を設定 | 一部効果あり(critic_loss急上昇は再発せず。ただしentropy崩壊は継続) |
+
+
+---
+
+## #002: entropy係数(ent_coef)の下限を0.01に設定
+
+- **日付**: 2026-09-01
+- **対象ファイル**: `sac_grad_clip.py`
+- **関連する崩壊事象**: #001適用後の新規学習にて、total_timesteps 46.6万時点でent_coefが
+  0.185→0.0000748まで単調に崩壊。critic_loss・actor_lossも同時にほぼ0へ収束しており、
+  方策が探索性を失いつつある兆候が見られた。critic_lossの異常なスパイクは今回は観測されず、
+  #001は一定の効果があったと考えられるが、entropy崩壊という別の根本原因が残っていたことが判明。
+
+### 問題点
+
+SACのent_coef(entropy自動調整の温度パラメータ)に下限が設定されておらず、auto-tuningが
+際限なく0に近づくことを許容していた。2026-09-01の新規学習では、わずか46.6万ステップで
+ent_coefが0.0000748まで低下し、これは前回の学習崩壊(破産)直前に観測された値
+(0.027、cumulative約240万ステップ時点)よりも1桁以上低い水準に、5分の1未満のステップ数で
+到達している。ent_coefがほぼ0になると方策はほぼ決定論的になり探索が失われ、リプレイバッファに
+溜まる経験の多様性が急減する。これによりcriticが狭い経験分布に過剰適合し、テスト時にポジション
+サイズが特定の値に固定され続ける(前回のUSDJPY -5.00lot固定など)という挙動につながって
+いたと考えられる。
+
+### 修正前のプログラム
+
+```python
+import numpy as np
+import torch
+from stable_baselines3 import SAC
+from stable_baselines3.common.utils import polyak_update
+from torch.nn import functional as F
+
+GRAD_CLIP_MAX_NORM = 10.0
+
+
+class SACWithGradClip(SAC):
+```
+
+```python
+            ent_coef_loss = None
+            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                ent_coef = torch.exp(self.log_ent_coef.detach())
+                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
+                ent_coef_losses.append(ent_coef_loss.item())
+            else:
+                ent_coef = self.ent_coef_tensor
+
+            ent_coefs.append(ent_coef.item())
+
+            if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
+                self.ent_coef_optimizer.zero_grad()
+                ent_coef_loss.backward()
+                self.ent_coef_optimizer.step()
+```
+
+### 修正後のプログラム
+
+```python
+import math
+import numpy as np
+import torch
+from stable_baselines3 import SAC
+from stable_baselines3.common.utils import polyak_update
+from torch.nn import functional as F
+
+GRAD_CLIP_MAX_NORM = 10.0
+ENT_COEF_MIN = 0.01
+
+
+class SACWithGradClip(SAC):
+```
+
+```python
+            ent_coef_loss = None
+            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                ent_coef = torch.clamp(torch.exp(self.log_ent_coef.detach()), min=ENT_COEF_MIN)
+                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
+                ent_coef_losses.append(ent_coef_loss.item())
+            else:
+                ent_coef = self.ent_coef_tensor
+
+            ent_coefs.append(ent_coef.item())
+
+            if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
+                self.ent_coef_optimizer.zero_grad()
+                ent_coef_loss.backward()
+                self.ent_coef_optimizer.step()
+                with torch.no_grad():
+                    self.log_ent_coef.data.clamp_(min=math.log(ENT_COEF_MIN))
+```
+
+### 期待される効果
+
+- ent_coefが0.01を下回らなくなるため、学習後半でも一定水準の探索性が維持され、
+  方策が決定論的に固まってしまう(特定のポジションサイズに固執する)ことを防ぐ
+- 探索性が保たれることで、リプレイバッファの経験の多様性が維持され、
+  criticの過学習的な収束(loss→0)も緩和されることを期待する
+- ENT_COEF_MIN=0.01は、今回のログで健全に見えた147,422ステップ時点の値(0.0148)に
+  近い水準を参考にした、精密なチューニングを要しない緩めの安全弁
+
+### 検証結果
+
 (次回の学習・テスト完了後に追記)
