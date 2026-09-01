@@ -4,7 +4,8 @@ import logging
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
-import datetime
+
+from datetime import datetime
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv,VecNormalize
 
