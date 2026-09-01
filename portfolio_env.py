@@ -4,6 +4,7 @@ import numpy as np
 import logging
 
 NEW_HIGH_BONUS_COEF = 2.0
+NEW_HIGH_BONUS_MAX = 5.0 
 DRAWDOWN_PENALTY_COEF = 10.0
 REALIZED_PNL_WEIGHT = 1.0
 UNREALIZED_PNL_WEIGHT = 0.2
@@ -316,7 +317,8 @@ class PortfolioFXEnv(gym.Env):
 
         
         if self.equity > self.high_water_mark:
-            reward += (self.equity - self.high_water_mark)/self.initial_balance * 100 * NEW_HIGH_BONUS_COEF
+            new_high_bonus = (self.equity - self.high_water_mark)/self.initial_balance * 100 * NEW_HIGH_BONUS_COEF
+            reward += min(new_high_bonus, NEW_HIGH_BONUS_MAX)
 
         self.prev_equity = self.equity
         self.current_step += 1
