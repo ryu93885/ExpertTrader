@@ -66,7 +66,7 @@ COUNTERFACTUAL_PENALTY_COEF = 1.0
 if self.equity > self.high_water_mark:
  new_high_bonus = (self.equity - self.high_water_mark)/self.initial_balance * 100 * NEW_HIGH_BONUS_COEF
  reward += min(new_high_bonus, NEW_HIGH_BONUS_MAX)
-
+```
 
 資産急騰時の報酬の突出を抑えることで、VecNormalizeの正規化が追従しやすくなり、
 criticのTDターゲットの不連続(≒ critic_lossの急上昇)が緩和されることを期待する
