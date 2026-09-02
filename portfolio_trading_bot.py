@@ -42,7 +42,7 @@ MIN_RR_RATIO = 1.5  # portfolio_env.py の学習時ロジックと一致させ�
 # (最大22連敗)を早期に遮断することを狙っている。値が下がれば(勝ちの有無に関わらず時間経過で
 # 自然減衰する)自動的に再開する。
 CIRCUIT_BREAKER_THRESHOLD = 3.0
-MIN_RR_RATIO = 1.5  # portfolio_env.py の学習時ロジックと一致させる最低リスクリワード比
+
 MAX_LOT_SIZE = 5.0  # portfolio_env.py の学習時ロジックと一致させるロット数の絶対上限
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
