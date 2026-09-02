@@ -42,6 +42,9 @@ MIN_RR_RATIO = 1.5  # portfolio_env.py の学習時ロジックと一致させ�
 # (最大22連敗)を早期に遮断することを狙っている。値が下がれば(勝ちの有無に関わらず時間経過で
 # 自然減衰する)自動的に再開する。
 CIRCUIT_BREAKER_THRESHOLD = 3.0
+MIN_RR_RATIO = 1.5  # portfolio_env.py の学習時ロジックと一致させる最低リスクリワード比
+MAX_LOT_SIZE = 5.0  # portfolio_env.py の学習時ロジックと一致させるロット数の絶対上限
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -372,12 +375,14 @@ class PortfolioFXTradingBot:
                     loss_per_price_unit = symbol_info.trade_tick_value / symbol_info.trade_tick_size
                     loss_for_this_trade = sl_dist * loss_per_price_unit
                     raw_lot = risk_amount / max(loss_for_this_trade, 1e-5)
+                    raw_lot = min(raw_lot, MAX_LOT_SIZE) 
                     
                     step = symbol_info.volume_step
                     target_pos = round(raw_lot / step) * step
                     target_pos = max(symbol_info.volume_min, min(target_pos, symbol_info.volume_max))
                 else:
                     target_pos = 0.01
+                
                 
                 if direction_sign > 0:
                     self._send_order(sym, mt5.ORDER_TYPE_BUY, target_pos, tp_dist, sl_dist)
