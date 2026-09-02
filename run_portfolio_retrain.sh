@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# ポートフォリオ強化学習(SAC)の再学習パイプライン。
+# portfolio_env.py / merge_portfolio_data.py の整合性修正を反映した状態で、
+# 1. データ統合 (merge_portfolio_data.py)
+# 2. アナライザ推論結果の事前計算 (precompute_portfolio.py, train/testの両フェーズ)
+# 3. SACエージェントの学習 (train_portfolio_rl.py)
+# を順番に実行する。setup_codespace.sh を先に実行し、データが揃っていることを
+# 確認してから使ってください。
+# 💡 test フェーズの事前計算も行うことで、学習後に test_portfolio.py で
+#   そのままバックテストできる状態にしておく。
+#
+#   bash run_portfolio_retrain.sh
+#
+set -euo pipefail
+
+# 💡 修正: 以前は "short" 固定で、mediumモード運用時に merge_portfolio_data.py /
+# train_portfolio_rl.py がmode引数を渡せず(常に内部デフォルトのshortを使ってしまい)、
+# 画像パスの不一致等が無言で発生する原因になっていた。実際に使用しているモードに
+# 合わせてここを変更してください。
+MODE="medium"
+BACKUP_DIR="saved_rl_models/_backup_before_fix_$(date +%Y%m%d_%H%M%S)"
+
+echo "=== 既存のポートフォリオRLモデルを退避 ==="
+echo "(壊れた環境 [spread単位/contract_size/USDJPYレート] で学習された旧モデルのため、"
+echo " 継続学習ではなく新規学習として再開します)"
+mkdir -p "$BACKUP_DIR"
+moved=0
+for f in \
+  "saved_rl_models/sac_portfolio_agent_${MODE}.zip" \
+  "saved_rl_models/vec_normalize.pkl" \
+  "saved_rl_models/sac_replay_buffer_${MODE}.pkl"
+do
+  if [ -f "$f" ]; then
+    mv "$f" "$BACKUP_DIR/"
+    echo "  退避: $f -> $BACKUP_DIR/"
+    moved=1
+  fi
+done
+# 💡 追加: train_portfolio_rl.py は完了済みモデルが無い場合、途中保存の
+# チェックポイント(saved_rl_models/checkpoints/)から最新のものを自動的に
+# 読み込んで再開する。完了済みモデルだけ退避してチェックポイントを残すと、
+# 「新規学習のつもり」が実際には古い(発散した可能性のある)途中保存から
+# 再開されてしまうため、こちらもまとめて退避する。
+if [ -d "saved_rl_models/checkpoints" ] && [ -n "$(ls -A saved_rl_models/checkpoints 2>/dev/null)" ]; then
+  mv "saved_rl_models/checkpoints" "$BACKUP_DIR/checkpoints"
+  echo "  退避: saved_rl_models/checkpoints/ -> $BACKUP_DIR/checkpoints/"
+  moved=1
+fi
+if [ "$moved" -eq 0 ]; then
+  echo "  (退避対象の既存モデル・チェックポイントは見つかりませんでした。新規学習として開始します)"
+fi
+
+echo ""
+echo "=== 1/3: データ統合 (merge_portfolio_data.py) ==="
+python merge_portfolio_data.py --mode "$MODE"
+
+echo ""
+echo "=== 2/4: アナライザ推論結果の事前計算 - train (precompute_portfolio.py) ==="
+python precompute_portfolio.py --phase train --mode "$MODE"
+
+echo ""
+echo "=== 3/4: アナライザ推論結果の事前計算 - test (precompute_portfolio.py) ==="
+python precompute_portfolio.py --phase test --mode "$MODE"
+
+echo ""
+echo "=== 4/4: ポートフォリオRL(SAC)の学習 (train_portfolio_rl.py) ==="
+python train_portfolio_rl.py --mode "$MODE"
+
+echo ""
+echo "=== 完了 ==="
+echo "学習済みモデル: saved_rl_models/sac_portfolio_agent_${MODE}.zip"
+echo "旧モデルのバックアップ: $BACKUP_DIR/"
+echo "バックテスト: python test_portfolio.py --mode ${MODE} で検証できます"
