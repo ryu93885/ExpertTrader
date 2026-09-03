@@ -9,6 +9,7 @@ import os
 import sys
 import logging
 import io
+import csv
 import traceback
 import matplotlib.pyplot as plt
 import mplfinance as mpf
@@ -44,6 +45,18 @@ MIN_RR_RATIO = 1.5  # portfolio_env.py の学習時ロジックと一致させ�
 CIRCUIT_BREAKER_THRESHOLD = 3.0
 
 MAX_LOT_SIZE = 5.0  # portfolio_env.py の学習時ロジックと一致させるロット数の絶対上限
+
+# 💡 追加: モデルの見直し(再学習判断・報酬設計の検証)に使うための診断ログ。
+# 自由記述のlogging.info()だけでは後から集計しづらいため、判断根拠(分析モデルの
+# 生出力・モデルのアクション・スキップ理由)と約定結果を、それぞれCSVに構造化して残す。
+DECISION_LOG_HEADERS = [
+    "timestamp", "symbol", "prob_0", "prob_1", "prob_2", "risk_val",
+    "position_before", "unrealized_pnl_ratio", "recent_losses",
+    "act_direction", "act_tp", "act_sl",
+    "decision", "lot_size", "sl_dist", "tp_dist", "order_retcode",
+    "equity", "balance",
+]
+TRADE_LOG_HEADERS = ["timestamp", "symbol", "profit", "volume", "price", "outcome"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -82,6 +95,12 @@ class PortfolioFXTradingBot:
         # MT5の約定履歴から損失決済だったかを確認して更新する(_update_recent_losses参照)。
         self.recent_losses = {sym: 0.0 for sym in self.symbols}
         self._last_known_position = {sym: 0.0 for sym in self.symbols}
+
+        # 💡 追加: モデル見直し用の診断ログ(判断ログ・約定結果ログ)の保存先
+        self.decision_log_path = os.path.join(LOG_DIR, f"decision_log_{mode}.csv")
+        self.trade_log_path = os.path.join(LOG_DIR, f"trade_log_{mode}.csv")
+        self._init_csv_log(self.decision_log_path, DECISION_LOG_HEADERS)
+        self._init_csv_log(self.trade_log_path, TRADE_LOG_HEADERS)
 
         # スケーラーのロード
         self.scalers = {}
@@ -168,6 +187,36 @@ class PortfolioFXTradingBot:
         total_profit = sum(p.profit for p in positions if p.magic == MAGIC_NUMBER)
         return total_profit / max(balance, 1e-8)
 
+    def _init_csv_log(self, path, headers):
+        """💡 追加: 診断ログ用CSVを、無ければヘッダー付きで新規作成する"""
+        if not os.path.exists(path):
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+
+    def _append_csv(self, path, headers, row):
+        """💡 追加: 診断ログCSVへの1行追記(書き込み失敗はログのみ・トレード自体は継続させる)"""
+        try:
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writerow(row)
+        except Exception as e:
+            logger.error(f"⚠️ 診断ログの書き込みに失敗しました ({path}): {e}")
+
+    def _write_decision_log(self, row):
+        self._append_csv(self.decision_log_path, DECISION_LOG_HEADERS, row)
+
+    def _write_trade_log(self, symbol, deal, outcome):
+        row = {
+            "timestamp": datetime.fromtimestamp(deal.time).strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "profit": deal.profit,
+            "volume": deal.volume,
+            "price": deal.price,
+            "outcome": outcome,
+        }
+        self._append_csv(self.trade_log_path, TRADE_LOG_HEADERS, row)
+
     def _update_recent_losses(self):
         """
         portfolio_env.py の self.recent_losses(銘柄別・直近連敗数)をライブ側でも再現する。
@@ -195,9 +244,14 @@ class PortfolioFXTradingBot:
                     closing_deals = [d for d in deals if d.magic == MAGIC_NUMBER and d.entry == mt5.DEAL_ENTRY_OUT]
                     if closing_deals:
                         latest_deal = max(closing_deals, key=lambda d: d.time)
+                        # 💡 追加: 勝敗を問わず決済結果を診断ログに記録する(従来は損失時のみ処理していた)
+                        outcome = "win" if latest_deal.profit >= 0 else "loss"
+                        self._write_trade_log(sym, latest_deal, outcome)
                         if latest_deal.profit < 0:
                             self.recent_losses[sym] = self.recent_losses.get(sym, 0.0) + 1.0
                             logger.info(f"📉 [{sym}] 決済損失を検知。連敗カウント: {self.recent_losses[sym]:.2f}")
+                        else:
+                            logger.info(f"📈 [{sym}] 決済利益を検知。損益: {latest_deal.profit:,.0f}円")
 
             self._last_known_position[sym] = current_pos
 
@@ -222,7 +276,7 @@ class PortfolioFXTradingBot:
             live_data = get_live_features(sym, self.mode)
             if live_data is None:
                 logger.warning(f"⚠️ {sym} のデータ取得失敗。観測生成をスキップします。")
-                return None, None
+                return None, None, None
                 
             live_df, raw_df = live_data[0], live_data[1]
             raw_dfs[sym] = raw_df
@@ -303,6 +357,9 @@ class PortfolioFXTradingBot:
         if self.initial_balance is None: self.initial_balance = account_info.balance
 
         obs_list = [account_info.balance / self.initial_balance]
+        # 💡 追加: モデル見直し用ログのため、分析モデルの生出力(prob_0/1/2, risk_val)を
+        # 観測ベクトルとは別に、銘柄をキーとした辞書としても保持しておく。
+        analyst_info = {}
         for i, sym in enumerate(self.symbols):
             obs_list.extend(probs[i])
             obs_list.append(risk_vals[i][0])
@@ -311,11 +368,18 @@ class PortfolioFXTradingBot:
             # 💡 portfolio_env.py ver209.0 と同じ並び順で、銘柄別の直近連敗数を末尾に追加
             obs_list.append(float(self.recent_losses.get(sym, 0.0)))
 
+            analyst_info[sym] = {
+                "prob_0": float(probs[i][0]),
+                "prob_1": float(probs[i][1]),
+                "prob_2": float(probs[i][2]),
+                "risk_val": float(risk_vals[i][0]),
+            }
+
         hybrid_obs_array = np.array([obs_list], dtype=np.float32)
         if self.vec_normalize is not None:
             normalized_obs = self.vec_normalize.normalize_obs(hybrid_obs_array)
-            return normalized_obs, raw_dfs
-        return hybrid_obs_array, raw_dfs
+            return normalized_obs, raw_dfs, analyst_info
+        return hybrid_obs_array, raw_dfs, analyst_info
 
     def execute_trade_logic(self):
 
@@ -323,75 +387,105 @@ class PortfolioFXTradingBot:
         self._update_recent_losses()
 
         logger.info("📡 ポートフォリオ全銘柄の相場データを取得・推論中...")
-        obs, raw_dfs = self._build_sac_observation()
+        obs, raw_dfs, analyst_info = self._build_sac_observation()
         if obs is None: return
 
         action, _ = self.rl_trader.predict(obs, deterministic=True)
         action = np.clip(np.array(action).flatten(), -1.0, 1.0)
-        
+
         account = mt5.account_info()
         equity = account.equity if account else 1000.0
+        balance = account.balance if account else 1000.0
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         for i, sym in enumerate(self.symbols):
-            current_pos = self._get_current_position(sym)
-            if current_pos != 0.0:
+            act_direction = float(action[i*3])
+            act_tp = float(action[i*3 + 1])
+            act_sl = float(action[i*3 + 2])
+            info = analyst_info.get(sym, {})
+
+            # 💡 追加: モデル見直し用の判断ログの雛形。分岐ごとに decision を埋めて記録する。
+            log_row = {
+                "timestamp": now_str, "symbol": sym,
+                "prob_0": info.get("prob_0"), "prob_1": info.get("prob_1"), "prob_2": info.get("prob_2"),
+                "risk_val": info.get("risk_val"),
+                "position_before": self._get_current_position(sym),
+                "unrealized_pnl_ratio": self._get_unrealized_pnl_ratio(sym, balance),
+                "recent_losses": self.recent_losses.get(sym, 0.0),
+                "act_direction": act_direction, "act_tp": act_tp, "act_sl": act_sl,
+                "decision": "", "lot_size": "", "sl_dist": "", "tp_dist": "", "order_retcode": "",
+                "equity": equity, "balance": balance,
+            }
+
+            if log_row["position_before"] != 0.0:
+                log_row["decision"] = "existing_position"
+                self._write_decision_log(log_row)
                 logger.debug(f"[{sym}] 既存ポジション保持中。AIの新規判断をスキップし、TP/SLに任せます。")
                 continue
 
             # 💡 サーキットブレーカー: 直近連敗数が閾値以上の銘柄は新規エントリーを見送る
             loss_streak = self.recent_losses.get(sym, 0.0)
             if loss_streak >= CIRCUIT_BREAKER_THRESHOLD:
+                log_row["decision"] = "circuit_breaker"
+                self._write_decision_log(log_row)
                 logger.warning(f"🛑 [{sym}] サーキットブレーカー作動中(直近連敗数: {loss_streak:.2f})。新規エントリーを見送ります。")
                 continue
 
-            act_direction = float(action[i*3])
-            act_tp = float(action[i*3 + 1])
-            act_sl = float(action[i*3 + 2])
-            
             threshold = 0.2
-            if abs(act_direction) > threshold:
-                direction_sign = 1.0 if act_direction > 0 else -1.0
-                
-                base_tf = "M5" if self.mode == "short" else "M15" if self.mode == "medium" else "H4"
-                tf = "M15" if self.mode == "short" else "H4" if self.mode == "medium" else "D1"
-                current_close = raw_dfs[sym][f"{base_tf}_close"].iloc[-1]
-                atr = raw_dfs[sym].get(f"{tf}_ATR", current_close * 0.005)
-                if isinstance(atr, pd.Series): atr = atr.iloc[-1]
+            if abs(act_direction) <= threshold:
+                log_row["decision"] = "below_threshold"
+                self._write_decision_log(log_row)
+                continue
 
-                # Envと完全に一致したTP/SL距離の計算
-                sl_dist = atr * (1.0 + (act_sl + 1.0))
-                tp_dist = atr * (1.0 + (act_tp + 1.0) * 2)
+            direction_sign = 1.0 if act_direction > 0 else -1.0
 
-                # Envと同じ最低リスクリワード比(MIN_RR_RATIO倍)のクランプ
-                min_tp_dist = sl_dist * MIN_RR_RATIO
-                if tp_dist < min_tp_dist:
-                    tp_dist = min_tp_dist
+            base_tf = "M5" if self.mode == "short" else "M15" if self.mode == "medium" else "H4"
+            tf = "M15" if self.mode == "short" else "H4" if self.mode == "medium" else "D1"
+            current_close = raw_dfs[sym][f"{base_tf}_close"].iloc[-1]
+            atr = raw_dfs[sym].get(f"{tf}_ATR", current_close * 0.005)
+            if isinstance(atr, pd.Series): atr = atr.iloc[-1]
 
-                # Envと完全に一致した動的ロット計算（リスク2%ベース）
-                risk_amount = equity * 0.02 * abs(act_direction)
-                
-                symbol_info = mt5.symbol_info(sym)
-                if symbol_info and symbol_info.trade_tick_size > 0:
-                    loss_per_price_unit = symbol_info.trade_tick_value / symbol_info.trade_tick_size
-                    loss_for_this_trade = sl_dist * loss_per_price_unit
-                    raw_lot = risk_amount / max(loss_for_this_trade, 1e-5)
-                    raw_lot = min(raw_lot, MAX_LOT_SIZE) 
-                    
-                    step = symbol_info.volume_step
-                    target_pos = round(raw_lot / step) * step
-                    target_pos = max(symbol_info.volume_min, min(target_pos, symbol_info.volume_max))
-                else:
-                    target_pos = 0.01
-                
-                
-                if direction_sign > 0:
-                    self._send_order(sym, mt5.ORDER_TYPE_BUY, target_pos, tp_dist, sl_dist)
-                else:
-                    self._send_order(sym, mt5.ORDER_TYPE_SELL, target_pos, tp_dist, sl_dist)
+            # Envと完全に一致したTP/SL距離の計算
+            sl_dist = atr * (1.0 + (act_sl + 1.0))
+            tp_dist = atr * (1.0 + (act_tp + 1.0) * 2)
+
+            # Envと同じ最低リスクリワード比(MIN_RR_RATIO倍)のクランプ
+            min_tp_dist = sl_dist * MIN_RR_RATIO
+            if tp_dist < min_tp_dist:
+                tp_dist = min_tp_dist
+
+            # Envと完全に一致した動的ロット計算（リスク2%ベース）
+            risk_amount = equity * 0.02 * abs(act_direction)
+
+            symbol_info = mt5.symbol_info(sym)
+            if symbol_info and symbol_info.trade_tick_size > 0:
+                loss_per_price_unit = symbol_info.trade_tick_value / symbol_info.trade_tick_size
+                loss_for_this_trade = sl_dist * loss_per_price_unit
+                raw_lot = risk_amount / max(loss_for_this_trade, 1e-5)
+                raw_lot = min(raw_lot, MAX_LOT_SIZE)
+
+                step = symbol_info.volume_step
+                target_pos = round(raw_lot / step) * step
+                target_pos = max(symbol_info.volume_min, min(target_pos, symbol_info.volume_max))
+            else:
+                target_pos = 0.01
+
+            log_row["lot_size"] = target_pos
+            log_row["sl_dist"] = sl_dist
+            log_row["tp_dist"] = tp_dist
+
+            if direction_sign > 0:
+                retcode = self._send_order(sym, mt5.ORDER_TYPE_BUY, target_pos, tp_dist, sl_dist)
+            else:
+                retcode = self._send_order(sym, mt5.ORDER_TYPE_SELL, target_pos, tp_dist, sl_dist)
+
+            log_row["order_retcode"] = retcode
+            log_row["decision"] = "order_sent" if retcode == mt5.TRADE_RETCODE_DONE else "order_rejected"
+            self._write_decision_log(log_row)
     def _send_order(self, symbol, order_type, lots, tp_dist, sl_dist):
-        if lots < 0.01: return
-            
-        
+        if lots < 0.01: return None
+
+
         account = mt5.account_info()
         if account is not None:
             equity = account.equity
@@ -447,6 +541,7 @@ class PortfolioFXTradingBot:
         else:
             t_str = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
             logger.info(f"✨ [{symbol}] 新規注文成功: {t_str} {lots:.2f} Lot")
+        return result.retcode
     def get_filling_mode(self, symbol):
         """XM対応版：ブローカーがサポートしている注文実行モードを取得・補正"""
         symbol_info = mt5.symbol_info(symbol)
