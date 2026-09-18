@@ -10,7 +10,15 @@ import sys
 import logging
 import io
 import csv
+import gc
 import traceback
+
+# 💡 追加: プロセスのメモリ使用量を診断ログに残すための任意依存。
+# 未インストールでも起動を止めないよう、失敗時はNoneのままにする。
+try:
+    import psutil
+except ImportError:
+    psutil = None
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import gymnasium as gym
@@ -291,9 +299,10 @@ class PortfolioFXTradingBot:
             tabs_list.append(torch.tensor(scaled_data, dtype=torch.float32).unsqueeze(0))
 
             # 画像データ生成（以前のボットのio.BytesIO方式を採用）
+            buf = None
             try:
                 buf = io.BytesIO()
-                chart_df = raw_df.tail(60).copy() 
+                chart_df = raw_df.tail(60).copy()
                 
                 def extract_tf_df(df, prefix):
                     tf_cols = [c for c in df.columns if c.startswith(prefix)]
@@ -332,16 +341,23 @@ class PortfolioFXTradingBot:
                 )
 
                 fig.savefig(buf, format='png', bbox_inches="tight", pad_inches=0.1, dpi=72)
-                plt.close(fig) 
-                
+
                 buf.seek(0)
                 img_pil = Image.open(buf).convert("RGB")
                 img_tensor = image_transform(img_pil).unsqueeze(0)
-                
+
             except Exception as e:
                 logger.error(f"画像生成エラー ({sym}): {e}")
                 img_tensor = torch.zeros((1, 3, 224, 224), dtype=torch.float32)
-            
+            finally:
+                # 💡 追加: 例外発生時(mpf.plot()の途中失敗など)もFigureが残り続けないよう、
+                # 成功・失敗を問わず必ずクローズする。plt.close(fig)がtry内の成功パスにしか
+                # 無かったため、画像生成に失敗するたびにFigureがpyplotのグローバル管理下に
+                # 残り続け、長時間稼働(約2日)でのメモリ増加・OS再起動の主因と考えられる。
+                plt.close('all')
+                if buf is not None:
+                    buf.close()
+
             imgs_list.append(img_tensor)
 
         imgs_tensor = torch.cat(imgs_list, dim=0).to(self.device)
@@ -482,6 +498,17 @@ class PortfolioFXTradingBot:
             log_row["order_retcode"] = retcode
             log_row["decision"] = "order_sent" if retcode == mt5.TRADE_RETCODE_DONE else "order_rejected"
             self._write_decision_log(log_row)
+
+        # 💡 追加: サイクルごとの明示的なガベージコレクション + メモリ使用量の可視化。
+        # plt.close('all')の修正で主因は解消される想定だが、切り分け・再発検知のための保険。
+        gc.collect()
+        if psutil is not None:
+            try:
+                mem_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+                logger.info(f"🧠 プロセスメモリ使用量: {mem_mb:,.1f} MB")
+            except Exception:
+                pass
+
     def _send_order(self, symbol, order_type, lots, tp_dist, sl_dist):
         if lots < 0.01: return None
 
