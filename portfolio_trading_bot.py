@@ -11,6 +11,7 @@ import logging
 import io
 import csv
 import gc
+import json
 import traceback
 
 # 💡 追加: プロセスのメモリ使用量を診断ログに残すための任意依存。
@@ -29,10 +30,11 @@ from gymnasium import spaces
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-# カスタムモジュールのパス設定
+# カスタムモシゲスのパス設定
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from datafetch_modeltrain.model import MultimodalFXmodel, SYMBOL_TO_ID
 from trade.live_datafetch import get_live_features
+from trade.historical_datafetch import get_historical_features  # 💡 追加: historical_replay.py用
 
 # ディレクトリ設定
 SAVE_MODEL_DIR = "../datafetch_modeltrain/saved_model"       
@@ -45,16 +47,16 @@ os.makedirs(LOG_DIR, exist_ok=True)
 INTERVAL_CONFIG = {"short": 5 * 60, "medium": 15 * 60, "long": 4 * 60 * 60}
 MAGIC_NUMBER = 20260626
 MIN_RR_RATIO = 1.5  # portfolio_env.py の学習時ロジックと一致させる最低リスクリワード比
-# 💡 サーキットブレーカー: self.recent_losses[sym](銘柄別の直近連敗数、0.9倍/サイクルで減衰)が
+# 💡 サーキットブレーカー: self.recent_losses[sym](銘柄別の直近連敗数、0.9倍/サイカルで減衰)が
 # この値以上になったら、その銘柄への新規エントリーを一時停止する。3.0は概ね「短期間に3〜4回
 # 連敗した状態」に相当し、実際のテストトレードで見られたGBPJPY等の高速な同方向再エントリー連敗
-# (最大22連敗)を早期に遮断することを狙っている。値が下がれば(勝ちの有無に関わらず時間経過で
+# (最夢22連敗)を早期に違断することを狙っている。値が下がれば(勝ちの有無に関わらず時間経過で
 # 自然減衰する)自動的に再開する。
 CIRCUIT_BREAKER_THRESHOLD = 3.0
 
 MAX_LOT_SIZE = 5.0  # portfolio_env.py の学習時ロジックと一致させるロット数の絶対上限
 
-# 💡 追加: モデルの見直し(再学習判断・報酬設計の検証)に使うための診断ログ。
+# 💡 追加: モデルの見直し(再学習判断・報酱設計の検証)に使うための診断ログ。
 # 自由記述のlogging.info()だけでは後から集計しづらいため、判断根拠(分析モデルの
 # 生出力・モデルのアクション・スキップ理由)と約定結果を、それぞれCSVに構造化して残す。
 DECISION_LOG_HEADERS = [
@@ -70,7 +72,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 class DummyEnvForLoading(gym.Env):
-    """💡 SB3のチェックをパスするためのポートフォリオ用ダミー環境"""
+    """💡 SB3のチックをパスするためのポートフォリオ用ダミー環境"""
     def __init__(self, observation_shape, num_actions):
         super(DummyEnvForLoading, self).__init__()
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=observation_shape, dtype=np.float32)
@@ -99,7 +101,7 @@ class PortfolioFXTradingBot:
 
         # 💡 portfolio_env.py の self.recent_losses (銘柄別・直近連敗数) と同じ役割。
         # ライブでは学習時のようにその場でSL/TP判定できないため、
-        # 「前回チェック時にあったポジションが今回無くなっている」ことを検知し、
+        # 「前回チェッキ時にあったポジションが今回無くなっている」ことを検知し、
         # MT5の約定履歴から損失決済だったかを確認して更新する(_update_recent_losses参照)。
         self.recent_losses = {sym: 0.0 for sym in self.symbols}
         self._last_known_position = {sym: 0.0 for sym in self.symbols}
@@ -229,9 +231,9 @@ class PortfolioFXTradingBot:
         """
         portfolio_env.py の self.recent_losses(銘柄別・直近連敗数)をライブ側でも再現する。
         学習時はステップ内でSL/TP判定と同時に連敗数を更新できるが、ライブではブローカーが
-        自動でSL/TPを執行するため、「前回チェック時にあったポジションが今回無くなっている」
+        自動でSL/TPを執行するため、「前回チェッキ時にあったポジションが今回無くなっている」
         ことをもって決済を検知し、MT5の約定履歴からその決済が損失だったかを確認する。
-        呼び出しごと(=学習時の1ステップに相当)に、全銘柄を0.9倍で減衰させる。
+        呼び出しごとに(=学習時の1ステップに相当)、全銘柄を0.9倍で減衰させる。
         """
         now = datetime.now()
         interval = INTERVAL_CONFIG.get(self.mode, 300)
@@ -266,29 +268,35 @@ class PortfolioFXTradingBot:
         for sym in self.symbols:
             self.recent_losses[sym] = self.recent_losses.get(sym, 0.0) * 0.9
 
-    def _build_sac_observation(self):
+    def _build_sac_observation(self, as_of=None):
         imgs_list = []
         tabs_list = []
         # 💡 B案: 銘柄埋め込み用のID。datafetch_modeltrain/model.py の SYMBOL_TO_ID を
-        # 唯一の対応表として使い、学習側とライブ側でズレないようにする。
+        # 唱一の対応表として使い、学習側とライブ側でずれないようにする。
         symbol_id_list = [SYMBOL_TO_ID[sym] for sym in self.symbols]
         raw_dfs = {}
-        
+
         image_transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        
+
         for sym in self.symbols:
-            live_data = get_live_features(sym, self.mode)
+            # 💡 追加: as_of を指定した場合は過去の指定時点を基準にデータを取得する
+            # (historical_replay.py からのバッックテスト再現用)。通常のライブ稼働では
+            # as_of=None のままなので、既存の挙動は一切変わらない。
+            if as_of is None:
+                live_data = get_live_features(sym, self.mode)
+            else:
+                live_data = get_historical_features(sym, self.mode, as_of)
             if live_data is None:
                 logger.warning(f"⚠️ {sym} のデータ取得失敗。観測生成をスキップします。")
                 return None, None, None
-                
+
             live_df, raw_df = live_data[0], live_data[1]
             raw_dfs[sym] = raw_df
-            
+
             # テーブルデータ
             live_df_filled = live_df.ffill().bfill().fillna(1).tail(40)
             scaler = self.scalers.get(sym)
@@ -374,7 +382,7 @@ class PortfolioFXTradingBot:
 
         obs_list = [account_info.balance / self.initial_balance]
         # 💡 追加: モデル見直し用ログのため、分析モデルの生出力(prob_0/1/2, risk_val)を
-        # 観測ベクトルとは別に、銘柄をキーとした辞書としても保持しておく。
+        # 観測ベトルとは別に、銘柄をキーとした辞書としても保持しておく。
         analyst_info = {}
         for i, sym in enumerate(self.symbols):
             obs_list.extend(probs[i])
@@ -399,7 +407,19 @@ class PortfolioFXTradingBot:
 
     def execute_trade_logic(self):
 
-        # 💡 観測を作る前に、前回チェックからの決済(勝敗)を反映して連敗数を更新する
+        # 💡 追加: VPS等の無人運用では、MT5の「アルゴリズム取引」が何らかの理由で
+        # 無効化されたことに誰も気づけない。注文拒否で間接的に気づくのではなく、
+        # サイカルの頭で毎回明示的にチェックし、無効なら重い推論処理自体を
+        # スキップして明確にログへ残す。
+        terminal_info = mt5.terminal_info()
+        if terminal_info is not None and not terminal_info.trade_allowed:
+            logger.error(
+                "🚫 MT5の「アルゴリズム取引」が無効になっています。新規注文は送信されません。"
+                "MT5ターミナルで有効化してください。このサイカルはスキップします。"
+            )
+            return
+
+        # 💡 観測を作る前に、前回チェッキからの決済(勝敗)を反映して連敗数を更新する
         self._update_recent_losses()
 
         logger.info("📡 ポートフォリオ全銘柄の相場データを取得・推論中...")
@@ -465,7 +485,7 @@ class PortfolioFXTradingBot:
             sl_dist = atr * (1.0 + (act_sl + 1.0))
             tp_dist = atr * (1.0 + (act_tp + 1.0) * 2)
 
-            # Envと同じ最低リスクリワード比(MIN_RR_RATIO倍)のクランプ
+            # Envと同じ最低リスキリワード比(MIN_RR_RATIO倍)のクランプ
             min_tp_dist = sl_dist * MIN_RR_RATIO
             if tp_dist < min_tp_dist:
                 tp_dist = min_tp_dist
@@ -499,7 +519,7 @@ class PortfolioFXTradingBot:
             log_row["decision"] = "order_sent" if retcode == mt5.TRADE_RETCODE_DONE else "order_rejected"
             self._write_decision_log(log_row)
 
-        # 💡 追加: サイクルごとの明示的なガベージコレクション + メモリ使用量の可視化。
+        # 💡 追加: サイカルごとの明示的なガベージコレキション + メモリ使用量の可視化。
         # plt.close('all')の修正で主因は解消される想定だが、切り分け・再発検知のための保険。
         gc.collect()
         if psutil is not None:
@@ -518,12 +538,12 @@ class PortfolioFXTradingBot:
             equity = account.equity
             symbol_info_cap = mt5.symbol_info(symbol)
 
-            # 💡 修正: 旧実装は「資産1000ドル/10万円あたり固定ロット」という、
+            # 💡 修正: 旧実装は「資甐1000ドル/10万円あたり固定ロット」という、
             # SL距離(sl_dist)を一切考慮しない静的な上限だった。このため、GOLDのように
             # ATRに応じてSL距離が広がる場面で、実際のリスクが意図した2%を大きく
             # 超過していた(実測でリスク6.9%〜12.2%、最大約6倍)。
             # execute_trade_logic()の2%リスク計算と同じ sl_dist 連動のロジックで、
-            # その2倍(4%)を「通常あり得ないはずの異常値」に対する最終防御ラインとする。
+            # その2倍(4%)を「通常あり得ないはずの異常値」に対する最終防衛ラインとする。
             MAX_RISK_PCT_HARD_CAP = 0.04
             if symbol_info_cap and symbol_info_cap.trade_tick_size > 0 and sl_dist > 0:
                 loss_per_price_unit = symbol_info_cap.trade_tick_value / symbol_info_cap.trade_tick_size
@@ -537,7 +557,7 @@ class PortfolioFXTradingBot:
                 absolute_safety_cap = max(0.01, round((equity / base_unit) * safety_multiplier, 2))
 
             if lots > absolute_safety_cap:
-                logger.warning(f"⚠️ [{symbol}] 防御フィルター作動: AIの要求ロットを {absolute_safety_cap:.2f} Lot に制限。")
+                logger.warning(f"⚠️ [{symbol}] 防衛フィルター作動: AIの要求ロットを {absolute_safety_cap:.2f} Lot に制限。")
                 lots = absolute_safety_cap
 
         tick = mt5.symbol_info_tick(symbol)
@@ -589,11 +609,93 @@ class PortfolioFXTradingBot:
         
         return mt5.ORDER_FILLING_IOC
 
+
+# 💡 追加: VPS等の無人運用を想定した補助関数群。
+# コンソールが見えない環境でも後から状態を追跡できるよう、ログファイル出力と
+# 「直近サイカルの状態」を記録するハートビートファイルを用意する。
+
+def setup_file_logging(mode):
+    log_path = os.path.join(LOG_DIR, f"bot_{mode}.log")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(file_handler)
+    logger.info(f"📝 ログファイル: {log_path}")
+
+
+def write_heartbeat(mode, status, detail=""):
+    """
+    直近サイカルの状態をJSONファイルに書き出す。外部の監視(Task Scheduler・
+    別プロセスの監視スクリプト等)から「ボットが生きているか・直近の状態」を
+    確認するために使う。書き込み自体の失敗はログのみに留め、トレード処理を
+    止めない。
+    """
+    path = os.path.join(LOG_DIR, f"heartbeat_{mode}.json")
+
+    equity = None
+    try:
+        account = mt5.account_info()
+        if account is not None:
+            equity = account.equity
+    except Exception:
+        pass
+
+    mem_mb = None
+    if psutil is not None:
+        try:
+            mem_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+        except Exception:
+            pass
+
+    data = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": status,
+        "detail": detail,
+        "pid": os.getpid(),
+        "equity": equity,
+        "memory_mb": mem_mb,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"⚠️ heartbeatファイルの書き込みに失敗しました: {e}")
+
+
+def run_trading_loop(bot, interval, mode):
+    """MT5接続が生きている前提での、通常のトレードサイカル繰り返し処理。"""
+    while True:
+        if not mt5.terminal_info():
+            if not mt5.initialize():
+                logger.error("MT5への再接続に失敗しました。60秒後に再試行します。")
+                write_heartbeat(mode, "error", "MT5再接続失敗")
+                time.sleep(60)
+                continue
+
+        try:
+            bot.execute_trade_logic()
+            write_heartbeat(mode, "ok")
+        except Exception as e:
+            logger.error(f"❌ トレードループエラー: {e}")
+            traceback.print_exc()
+            write_heartbeat(mode, "error", str(e))
+
+        # 次の「interval分の倍数」の時刻を計算して、そこまで待機する
+        now = datetime.now()
+        interval_minutes = interval // 60
+        minutes_to_add = interval_minutes - (now.minute % interval_minutes)
+        next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_add)
+
+        sleep_time = (next_run - now).total_seconds()
+        logger.info(f"💤 次の確定足({next_run.strftime('%H:%M:00')})まで {sleep_time:.1f} 秒待機します...")
+
+        time.sleep(sleep_time)
+
+
 def main():
     print("========================================")
     print(" 🌍 ポートフォリオ強化学習 自動売買システム")
     print("========================================")
-    
+
     # 学習時と「完全一致」の順番
     TARGET_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
 
@@ -604,59 +706,54 @@ def main():
     print(f"対象銘柄: {', '.join(TARGET_SYMBOLS)}")
     print(f"モード  : {mode}")
     print("----------------")
-    
-    if not mt5.initialize():
-        logger.error("MT5の初期化に失敗しました。終了します。")
-        sys.exit()
 
-    # MT5の気配値に追加・待機処理（データ取得エラー防止）
-    for sym in TARGET_SYMBOLS:
-        if not mt5.symbol_select(sym, True):
-            logger.error(f"❌ {sym} をMT5の気配値に追加できませんでした。MT5の銘柄名を確認してください。")
-            sys.exit()
+    setup_file_logging(mode)
 
-    logger.info("⏳ MT5サーバーから過去データを同期しています。5秒お待ちください...")
-    time.sleep(5)
-    for sym in TARGET_SYMBOLS:
-        mt5.symbol_info_tick(sym)
+    # 💡 追加: VPS等の無人運用では、プロセスが落ちても誰も再起動できない。
+    # MT5接続・ボット初期化を含め、予期しない例外が起きてもプロセスごとは
+    # 終了させず、ログ・ heartbeatを残して自動的に再試行し続ける
+    # (手動停止=Ctrl+Cのみプロセスを終了させる)。
+    while True:
+        try:
+            if not mt5.initialize():
+                logger.error("MT5の初期化に失敗しました。60秒後に再試行します。")
+                write_heartbeat(mode, "error", "MT5初期化失敗")
+                time.sleep(60)
+                continue
 
-    bot = PortfolioFXTradingBot(symbols=TARGET_SYMBOLS, mode=mode)
-    interval = INTERVAL_CONFIG.get(mode, 300)
+            symbol_select_ok = True
+            for sym in TARGET_SYMBOLS:
+                if not mt5.symbol_select(sym, True):
+                    logger.error(f"❌ {sym} をMT5の気配値に追加できませんでした。60秒後に再試行します。")
+                    symbol_select_ok = False
+                    break
+            if not symbol_select_ok:
+                write_heartbeat(mode, "error", "銘柄選択失敗")
+                time.sleep(60)
+                continue
 
-    logger.info(f"=== 稼働開始 (更新間隔: {interval}秒) ===")
-    
-    try:
-        while True:
-            if not mt5.terminal_info():
-                if not mt5.initialize():
-                    time.sleep(60)
-                    continue
+            logger.info("⏳ MT5サーバーから過去データを同期しています。5秒お待ちください...")
+            time.sleep(5)
+            for sym in TARGET_SYMBOLS:
+                mt5.symbol_info_tick(sym)
 
-                # 1. まずトレードロジックを実行
-            try:
-                bot.execute_trade_logic()
-            except Exception as e:
-                logger.error(f"❌ トレードループエラー: {e}")
-                import traceback
-                traceback.print_exc()
+            bot = PortfolioFXTradingBot(symbols=TARGET_SYMBOLS, mode=mode)
+            interval = INTERVAL_CONFIG.get(mode, 300)
 
-            # 2. 次の「5分の倍数」の時刻を計算して、そこまで待機する
-            now = datetime.now()
-            # M5なら5分、M15なら15分単位で同期（modeに合わせてインターバルを分に変換）
-            interval_minutes = interval // 60 
-            
-            # 次の実行時刻を算出 (例: 10:03 なら 10:05:00)
-            minutes_to_add = interval_minutes - (now.minute % interval_minutes)
-            next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_add)
-            
-            sleep_time = (next_run - now).total_seconds()
-            logger.info(f"💤 次の確定足({next_run.strftime('%H:%M:00')})まで {sleep_time:.1f} 秒待機します...")
-            
-            time.sleep(sleep_time)
-    except KeyboardInterrupt:
-        logger.info("システムが停止されました。")
-    finally:
-        mt5.shutdown()
+            logger.info(f"=== 稼働開始 (更新間隔: {interval}秒) ===")
+            run_trading_loop(bot, interval, mode)
+
+        except KeyboardInterrupt:
+            logger.info("システムが手動で停止されました。")
+            break
+        except Exception as e:
+            logger.error(f"❌ 想定外のエラーが発生したため。60秒後に再起動します: {e}")
+            traceback.print_exc()
+            write_heartbeat(mode, "error", str(e))
+            time.sleep(60)
+        finally:
+            mt5.shutdown()
+
 
 if __name__ == "__main__":
     main()
