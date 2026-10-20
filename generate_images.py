@@ -2,6 +2,7 @@ import pandas as pd
 import mplfinance as mpf
 import os
 import logging
+import shutil
 import concurrent.futures
 import matplotlib.pyplot as plt
 import matplotlib
@@ -16,6 +17,27 @@ MTF_IMAGE_SIZE = (9.33, 9.33)
 DPI = 72
 
 OVERWRITE = False #Being false,it generate only new period. else it generate all period entered by user.
+
+# 💡 追加: Colabのローカルディスクはセッション切断で消えるため、新規生成した画像は
+# 必ずここにもコピーして永続化する(run_colab_pipeline.py の復元ロジックと対になる)。
+DRIVE_IMAGES_DIR = "/content/drive/MyDrive/FX_AI_Models/images"
+
+
+def backup_new_images_to_drive(symbol, mode, generated_paths):
+    """Google Driveがマウントされていれば、今回新たに生成した画像だけをコピーする
+    (既存の全画像を毎回コピーし直すのは枚数が多く非効率なため)。"""
+    if not os.path.exists("/content/drive/MyDrive") or not generated_paths:
+        return
+    dest_dir = os.path.join(DRIVE_IMAGES_DIR, symbol, f"{mode}_MTF")
+    os.makedirs(dest_dir, exist_ok=True)
+    copied = 0
+    for local_path in generated_paths:
+        try:
+            shutil.copy2(local_path, os.path.join(dest_dir, os.path.basename(local_path)))
+            copied += 1
+        except Exception as e:
+            logging.error(f"⚠️ Google Driveへの画像バックアップに失敗しました ({local_path}): {e}")
+    logging.info(f"☁️ {symbol}({mode}): 新規生成した画像 {copied}/{len(generated_paths)} 件をGoogle Driveにバックアップしました: {dest_dir}")
 
 
 TF_RESAMPLE_RULES = {
@@ -84,7 +106,7 @@ def generate_mtf_images_for_symbol(symbol, mode,start_date = None,end_date = Non
     df["time"] = pd.to_datetime(df["time"])
     df.set_index("time", inplace=True)
 
-    # モードから3つの時間足プレフィックスを決定 (例: short -> M5, M15, M30)
+    # モードから3つの時間軸プレフィックスを決定 (例: short -> M5, M15, M30)
     if mode == "short":
         tfs = ["M5", "M15", "M30"]
     elif mode == "medium":
@@ -158,7 +180,11 @@ def generate_mtf_images_for_symbol(symbol, mode,start_date = None,end_date = Non
         # 1枚のMTF画像として描画・保存
         tasks.append((window_base,window_mid,window_long,save_path))
     with concurrent.futures.ProcessPoolExecutor() as executor:
-        list(tqdm(executor.map(process_single_mtf_image,tasks),total = len(tasks),desc=f"{symbol} {mode} MTF Images"))
+        results = list(tqdm(executor.map(process_single_mtf_image,tasks),total = len(tasks),desc=f"{symbol} {mode} MTF Images"))
+
+    # 💡 追加: 今回のループで実際に新規生成できた画像(失敗分は除く)だけをDriveへ永続化する。
+    generated_paths = [task[3] for task, ok in zip(tasks, results) if ok]
+    backup_new_images_to_drive(symbol, mode, generated_paths)
 
 def main():
     setup_logger()

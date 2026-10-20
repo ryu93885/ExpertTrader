@@ -5,12 +5,31 @@ import pandas as pd
 import numpy as np
 import os
 import logging
+import shutil
 from tqdm import tqdm
 
 from portfolio_dataset import PortfolioFXDataset
 from model import MultimodalFXmodel, SYMBOL_TO_ID
 
 logging.basicConfig(level=logging.INFO,format = "%(asctime)s [%(levelname)s] %(message)s")
+
+# 💡 追加: merge_portfolio_data.py と同じDrive保存先(永続化用)。
+DRIVE_PORTFOLIO_DATA_DIR = "/content/drive/MyDrive/FX_AI_Models/portfolio_data"
+
+
+def backup_to_drive(local_path):
+    """Google Driveがマウントされていれば、生成したファイルをコピーして永続化する。"""
+    if not os.path.exists("/content/drive/MyDrive"):
+        return
+    try:
+        os.makedirs(DRIVE_PORTFOLIO_DATA_DIR, exist_ok=True)
+        dest = os.path.join(DRIVE_PORTFOLIO_DATA_DIR, os.path.basename(local_path))
+        shutil.copy2(local_path, dest)
+        logging.info(f"☁️ Google Driveにバックアップしました: {dest}")
+    except Exception as e:
+        logging.error(f"⚠️ Google Driveへのバックアップに失敗しました ({local_path}): {e}")
+
+
 def collate_fn_drop_none(batch):
     batch = [b for b in batch if b is not None]
     if len(batch) == 0:
@@ -18,7 +37,7 @@ def collate_fn_drop_none(batch):
     return dataloader.default_collate(batch)
 
 def main():
-    logging.info("precompute_portfolio.py ver209.0")
+    logging.info("precompute_portfolio.py ver209.1")
     # 💡 修正: 以前は "train" フェーズ専用に固定されており、test_portfolio.py が
     # 必要とする "portfolio_merged_data_test_with_preds.csv" を作る手段が存在しなかった。
     # (merge_portfolio_data.py は train/test 両方を出力するのに、precompute側が
@@ -88,6 +107,7 @@ def main():
         df[f"{sym}_risk_val"] = all_risks[sym]
     df.to_csv(output_csv, index=False)
     logging.info(f"✨ 事前推論完了！ {output_csv} に保存しました。")
+    backup_to_drive(output_csv)
 
 if __name__ == "__main__":
     main()
