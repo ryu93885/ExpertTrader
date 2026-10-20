@@ -4,11 +4,29 @@ import os
 import glob
 import logging
 import argparse
+import shutil
+
+# 💡 追加: Colabのローカルディスクはセッション切断で消えるため、生成した統合データは
+# 必ずここにもコピーして永続化する(run_colab_pipeline.py の復元ロジックと対になる)。
+DRIVE_PORTFOLIO_DATA_DIR = "/content/drive/MyDrive/FX_AI_Models/portfolio_data"
 
 
 def setup_logger():
     logging.basicConfig(level=logging.INFO,format = "%(asctime)s [%(levelname)s] %(message)s")
- 
+
+
+def backup_to_drive(local_path):
+    """Google Driveがマウントされていれば、生成したファイルをコピーして永続化する。"""
+    if not os.path.exists("/content/drive/MyDrive"):
+        return
+    try:
+        os.makedirs(DRIVE_PORTFOLIO_DATA_DIR, exist_ok=True)
+        dest = os.path.join(DRIVE_PORTFOLIO_DATA_DIR, os.path.basename(local_path))
+        shutil.copy2(local_path, dest)
+        logging.info(f"☁️ Google Driveにバックアップしました: {dest}")
+    except Exception as e:
+        logging.error(f"⚠️ Google Driveへのバックアップに失敗しました ({local_path}): {e}")
+
 # portfolio_env.py の取引ロジック（エントリー価格・TP/SL・ATR・raw_pnl計算）に
 # 実際に必要な、生の価格系の列だけを _labeled.csv から拾う。
 # MACD/RSI/EMA等のモデル入力用テクニカル指標は、標準化済みの _scaled 側に
@@ -16,13 +34,13 @@ def setup_logger():
 RAW_FIELD_SUFFIXES = ["open", "high", "low", "close", "spread", "ATR"]
  
 # 学習ターゲット列は "close" 等のサフィックスに偶然マッチしてしまうため、
-# 明示的に除外する（portfolio_dataset.py の exclude_exact と揃えてある）。
+# 明示的に除外する（portfolio_dataset.py の exclude_exact と揺えてある）。
 RAW_FIELD_EXCLUDE = {"future_close", "price_diff_pct", "target_class", "target_risk_pct"}
  
  
 def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "portfolio_merged_data.csv",phase = "train"):
     setup_logger()
-    logging.info("merge_portfolio_data.py ver208.3")
+    logging.info("merge_portfolio_data.py ver208.4")
     output_file = f"portfolio_merged_data_{phase}.csv"
  
     csv_paths = glob.glob(os.path.join(csv_dir,f"*_{mode}_scaled_{phase}.csv"))
@@ -135,7 +153,8 @@ def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "
     #4.保存
     merged_df.to_csv(output_file,index = False)
     logging.info(f"ポートフォリオ統合データの作成が完了しました。->{output_file}")
- 
+    backup_to_drive(output_file)
+
     logging.info(f"最終データ形状:{merged_df.shape}")
  
  

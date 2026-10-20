@@ -2,6 +2,7 @@ import os
 import torch
 import logging
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import argparse
 
@@ -12,6 +13,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv,VecNormalize
 from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv
 from rl_checkpoint_utils import resolve_model_paths
+from backtest_metrics import compute_performance_summary, log_performance_summary
 
 DRIVE_TEST_RESULTS_DIR = "/content/drive/MyDrive/FX_AI_Models/test_results"
 LOCAL_TEST_RESULTS_DIR = "test_results"
@@ -39,6 +41,14 @@ def main():
     # 旧デフォルトは USDCAD/USDCHF を含んでおり、実際のシステムの銘柄構成と一致していなかった。
     parser.add_argument("--symbols",default=["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"])
     parser.add_argument("--mode",default = "short",help = "モード選択",choices = ["short","medium","long"])
+    # 💡 追加: 動的エントリー閾値・同時保有上限を手動で試したい場合用のオプション。
+    # 省略時はNone(動的閾値オフ・同時保有無制限)で、従来の固定閾値0.2のままになる。
+    parser.add_argument("--entry-threshold-window", type=int, default=None,
+                         help="動的エントリー閾値のローリングウィンドウ(銘柄ごとのサンプル数)。省略時は従来の固定閾値0.2のまま")
+    parser.add_argument("--entry-threshold-percentile", type=float, default=70,
+                         help="動的エントリー閾値に使うパーセンタイル")
+    parser.add_argument("--max-concurrent-positions", type=int, default=None,
+                         help="同時保有できる最大銘柄数。省略時は無制限")
     args = parser.parse_args()
 
     # 💡 追加: ログファイル・グラフの保存先を先に決定してからロガーを初期化することで、
@@ -48,7 +58,7 @@ def main():
     log_file_path = os.path.join(results_dir, f"test_portfolio_{args.mode}_{timestamp}.log")
     setup_logger(log_file_path)
 
-    logging.info("test_portfolio.py ver209.1")
+    logging.info("test_portfolio.py ver211.0")
     if results_dir == DRIVE_TEST_RESULTS_DIR:
         logging.info(f"Google Driveを検出。テスト結果の保存先をDriveに設定します: {results_dir}")
     else:
@@ -96,7 +106,12 @@ def main():
     # 使われていなかった(死んだコード)ため、丸ごと削除した。
 
     #テスト用環境の構築とvecnormalizeの復元
-    env = PortfolioFXEnv(dataset = dataset,symbols = args.symbols,fixed_start=True)
+    env = PortfolioFXEnv(
+        dataset = dataset,symbols = args.symbols,fixed_start=True,
+        entry_threshold_window=args.entry_threshold_window,
+        entry_threshold_percentile=args.entry_threshold_percentile,
+        max_concurrent_positions=args.max_concurrent_positions,
+    )
     vec_env = DummyVecEnv([lambda:env])
 
     vec_env = VecNormalize.load(vec_norm_path,vec_env)
@@ -118,6 +133,11 @@ def main():
     equities = []
     balances = []
 
+    # 💡 追加: 決済(realized_pnl_by_symbolが非ゼロになったステップ)ごとに
+    # 銘柄・損益を記録し、ループ終了後に勝率・プロフィットファクターなどの
+    # トレード単位の集計値を算出するために使う。
+    trades = []
+
     step_count = 0
 
 
@@ -133,15 +153,19 @@ def main():
         equities.append(info["equity"])
         balances.append(info["balance"])
 
+        realized = info.get("realized_pnl_by_symbol", {})
+        for sym, pnl in realized.items():
+            if pnl != 0:
+                trades.append({"step": step_count + 1, "symbol": sym, "pnl": pnl})
+
         step_count += 1
         if step_count % 10 == 0:
             logging.info(f"Step {step_count:04d} | Equity: {info['equity']:,.0f} 円 | Balance: {info['balance']:,.0f} 円")
             # 💡 追加: 銘柄別の建玉・価格・実現/含み損益を出力する。
-            # 資産の急変(急騰・急落)がどの銘柄に由来するかを確認するため。
+            # 資産の急変(急騰・急落)がどの銘柄に由来するか確認するため。
             positions = info.get("positions", {})
             prices = info.get("prices", {})
             unrealized = info.get("unrealized_pnl_by_symbol", {})
-            realized = info.get("realized_pnl_by_symbol", {})
             for sym in positions:
                 pos = positions[sym]
                 r_pnl = realized.get(sym, 0.0)
@@ -165,6 +189,20 @@ def main():
             "⚠️ 資産が初期資金の50%を下回ったため、テスト期間を最後まで走り切れずに"
             "シミュレーションが強制終了しました。"
         )
+
+    # 💡 修正: 利益率・勝率・プロフィットファクターなどの集計ロジックを
+    # backtest_metrics.py に共通化(sweep_entry_threshold.py と共有するため)。
+    initial_balance = env.initial_balance
+    elapsed_days = None
+    if step_count > 0:
+        start_idx = dataset.seq_length
+        end_idx = min(start_idx + step_count - 1, len(dataset.df) - 1)
+        start_ts = pd.to_datetime(dataset.df["time"].iloc[start_idx])
+        end_ts = pd.to_datetime(dataset.df["time"].iloc[end_idx])
+        elapsed_days = (end_ts - start_ts).total_seconds() / 86400.0
+
+    summary = compute_performance_summary(equities, balances, trades, initial_balance, elapsed_days)
+    log_performance_summary(summary)
 
     #結果の評価と可視化
     #結果の評価と可視化

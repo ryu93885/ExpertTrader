@@ -1,5 +1,6 @@
 import gymnasium as gym
 from gymnasium import spaces
+from collections import deque
 import numpy as np
 import logging
 
@@ -12,25 +13,48 @@ MIN_RR_RATIO = 1.5
 CONSECUTIVE_LOSS_PENALTY_COEF = 0.5
 COUNTERFACTUAL_PENALTY_COEF = 1.0
 
+# 💡 追加: 新規エントリー判定の閾値(abs(act_direction)と比較する値)。
+# entry_threshold_window を指定しない場合(デフォルト)は、常にこの固定値のみを使う
+# (従来通りの挙動と完全に同一)。entry_threshold_windowを指定すると、銘柄ごとの
+# 直近の行動分布から動的に閾値を計算するようになり、この固定値はサンプルが
+# 十分に溢まるまでのフォールバック、および動的閾値の下限(ENTRY_THRESHOLD_FLOOR)として
+# のみ使われる。
+ENTRY_THRESHOLD_FALLBACK = 0.2
+ENTRY_THRESHOLD_FLOOR = 0.05
+
 
 class PortfolioFXEnv(gym.Env):
     """
     7銘柄同時並行トレード環境（Action Space: 21次元）
     1つの口座資金を共有し、相関関係を利用したヘッジトレードを学習する
     """
-    def __init__(self, dataset,symbols, initial_balance=10000000,fixed_start = False):
+    def __init__(self, dataset,symbols, initial_balance=10000000,fixed_start = False,
+                 entry_threshold_window=None, entry_threshold_percentile=70,
+                 max_concurrent_positions=None):
         super(PortfolioFXEnv, self).__init__()
         logging.info("PortfolioFXEnv: 21-Action Multi-Asset Initialization")
-        logging.info("portfolio_env.py ver209.0")
-        
+        logging.info("portfolio_env.py ver210.0")
+
         self.dataset = dataset
-        
+
         self.symbols = symbols
         self.num_symbols = len(symbols)
-        
+
         self.initial_balance = initial_balance
 
         self.fixed_start = fixed_start
+
+        # 💡 追加: 動的エントリー閾値のローリングウィンドウ(銘柄ごとのサンプル数)。
+        # Noneなら動的閾値は無効化され、常にENTRY_THRESHOLD_FALLBACKを使う
+        # (train_portfolio_rl.py / test_portfolio.py の既存の呼び出しは引数を渡さないため、
+        # 従来の挙動と完全に同一のまま変わらない)。
+        self.entry_threshold_window = entry_threshold_window
+        self.entry_threshold_percentile = entry_threshold_percentile
+        # 💡 追加: 同時に保有できる最大銘柄数(ポートフォリオ全体)。Noneなら無制限
+        # (従来通り)。間口を広げる(動的閾値で取引頻度を増やす)ほど、相関の強い
+        # 複数銘柄が同時にシグナルを出した際の急変動への同時エクスポージャーが
+        # 増えるため、そのリスクを抑えるための安全策。
+        self.max_concurrent_positions = max_concurrent_positions
         # 銘柄ごとの設定値（コントラクトサイズやポイントバリュー）
         # 💡 修正: 旧ロジックは "USDJPY" or "EUR" を含むかどうかだけで判定しており、
         # GBPUSD/AUDUSD/GBPJPY が誤ってGOLDと同じ扱い(contract_size=100)になっていた。
@@ -71,6 +95,28 @@ class PortfolioFXEnv(gym.Env):
         # 銘柄ごとの辞書に変更。_get_observation() にも含めることで、
         # エージェントが「この銘柄で連敗している」ことを直接認識できるようにする。
         self.recent_losses = {sym: 0.0 for sym in self.symbols}
+
+        # 💡 追加: 動的エントリー閾値用、銘柄ごとの直近abs(act_direction)履歴。
+        # entry_threshold_window が未設定(None)の間は使わない。
+        if self.entry_threshold_window:
+            self.recent_abs_act_direction = {
+                sym: deque(maxlen=self.entry_threshold_window) for sym in self.symbols
+            }
+        else:
+            self.recent_abs_act_direction = {}
+
+    def _compute_entry_threshold(self, sym):
+        """
+        銘柄ごとの動的エントリー閾値を計算する。entry_threshold_window が
+        未設定、またはその銘柄の履歴サンプルがまだウィンドウ分溢まっていない間は、
+        安全重視で固定閾値(ENTRY_THRESHOLD_FALLBACK)にフォールバックする。
+        """
+        if not self.entry_threshold_window:
+            return ENTRY_THRESHOLD_FALLBACK
+        history = self.recent_abs_act_direction[sym]
+        if len(history) < self.entry_threshold_window:
+            return ENTRY_THRESHOLD_FALLBACK
+        return max(np.percentile(history, self.entry_threshold_percentile), ENTRY_THRESHOLD_FLOOR)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -161,7 +207,7 @@ class PortfolioFXEnv(gym.Env):
         row = self.dataset.df.iloc[self.current_step]
         base_tf = "M5" if self.dataset.mode == "short" else "M15" if self.dataset.mode == "medium" else "H4"
         tf = "M15" if self.dataset.mode == "short" else "H4" if self.dataset.mode == "medium" else "D1"
-        # 💡 修正: "_raw" が抜けており、標準化済み(Zスコア)の値を実勢レートとして
+        # 💡 修正: "_raw" が抖けており、標準化済み(Zスコア)の値を実勢レートとして
         # 使ってしまっていた(_get_observation()側は元々 "_raw" 付きで正しい)。
         usdjpy_col = f"USDJPY_{base_tf}_close_raw"
         if usdjpy_col in row.index:
@@ -238,8 +284,17 @@ class PortfolioFXEnv(gym.Env):
                     self.positions[sym] = 0.0
             
             # 2. 新規エントリー判定
-            threshold = 0.2
-            if self.positions[sym] == 0 and abs(act_direction) > threshold:
+            # 💡 修正: 固定値0.2から、銘柄ごとの直近の行動分布に基づく動的閾値に変更
+            # (entry_threshold_window未設定時は従来通りENTRY_THRESHOLD_FALLBACK=0.2のまま)。
+            threshold = self._compute_entry_threshold(sym)
+            # 💡 追加: 同時保有銘柄数が上限に達している場合は新規エントリーを見送る
+            # (max_concurrent_positions未設定時は従来通り無制限)。
+            concurrent_positions = sum(1 for s in self.symbols if self.positions[s] != 0)
+            can_open_new = (
+                self.max_concurrent_positions is None
+                or concurrent_positions < self.max_concurrent_positions
+            )
+            if self.positions[sym] == 0 and can_open_new and abs(act_direction) > threshold:
                 direction_sign = 1.0 if act_direction > 0 else -1.0
                 risk_amount = max(self.equity, 0) * 0.02 * abs(act_direction)
                 
@@ -287,6 +342,11 @@ class PortfolioFXEnv(gym.Env):
                 else:
                     self.tp_prices[sym] = current_close - tp_dist
                     self.sl_prices[sym] = current_close + sl_dist
+
+            # 💡 追加: 今回の生の行動の強さを履歴に記録する(次ステップ以降の動的閾値計算用)。
+            # 今回自身の判定には使っていない(自己参照を避けるため、上の閾値計算より後に追加する)。
+            if self.entry_threshold_window:
+                self.recent_abs_act_direction[sym].append(abs(float(act_direction)))
 
             # 3. 含み損益の更新
             if self.positions[sym] != 0:
