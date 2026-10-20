@@ -55,6 +55,14 @@ CIRCUIT_BREAKER_THRESHOLD = 3.0
 
 MAX_LOT_SIZE = 5.0  # portfolio_env.py の学習時ロジックと一致させるロット数の絶対上限
 
+# 💡 追加: 同時に保有できる最大銘柄数(ポートフォリオ全体)。今後エントリー閾値を
+# 動的化して取引頻度を上げる予定があり、間口を広げるほど、相関の強い複数銘柄が
+# 同時にシグナルを出した際の急変動への同時エクスポージャーが増える。そのリスクを
+# 抑えるための安全策として、閾値の変更に先行して導入する(この値自体は現状の
+# 固定閾値0.2のままでも機能する、独立した安全策)。portfolio_env.py の
+# max_concurrent_positions と同じ考え方・同じデフォルト値(4)。
+MAX_CONCURRENT_POSITIONS = 4
+
 # 💡 追加: モデルの見直し(再学習判断・報酬設計の検証)に使うための診断ログ。
 # 自由記述のlogging.info()だけでは後から集計しづらいため、判断根拠(分析モデルの
 # 生出力・モデルのアクション・スキップ理由)と約定結果を、それぞれCSVに構造化して残す。
@@ -427,6 +435,12 @@ class PortfolioFXTradingBot:
         balance = account.balance if account else 1000.0
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # 💡 追加: サイクル開始時点の銘柄別ポジションを1回だけまとめて取得する
+        # (従来は銘柄ごとのループ内で毎回MT5に問い合わせていた)。この値は
+        # log_row["position_before"]だけでなく、同時保有数の上限チェックにも使う。
+        positions_before = {s: self._get_current_position(s) for s in self.symbols}
+        concurrent_positions = sum(1 for p in positions_before.values() if p != 0)
+
         for i, sym in enumerate(self.symbols):
             act_direction = float(action[i*3])
             act_tp = float(action[i*3 + 1])
@@ -438,7 +452,7 @@ class PortfolioFXTradingBot:
                 "timestamp": now_str, "symbol": sym,
                 "prob_0": info.get("prob_0"), "prob_1": info.get("prob_1"), "prob_2": info.get("prob_2"),
                 "risk_val": info.get("risk_val"),
-                "position_before": self._get_current_position(sym),
+                "position_before": positions_before[sym],
                 "unrealized_pnl_ratio": self._get_unrealized_pnl_ratio(sym, balance),
                 "recent_losses": self.recent_losses.get(sym, 0.0),
                 "act_direction": act_direction, "act_tp": act_tp, "act_sl": act_sl,
@@ -465,6 +479,21 @@ class PortfolioFXTradingBot:
                 log_row["decision"] = "below_threshold"
                 self._write_decision_log(log_row)
                 continue
+
+            # 💡 追加: 同時保有銘柄数が上限に達している場合は新規エントリーを見送る
+            # (急な値動きへの対策。複数銘柄が同時にシグナルを出した場合の相関リスクを抑える)。
+            if concurrent_positions >= MAX_CONCURRENT_POSITIONS:
+                log_row["decision"] = "max_concurrent_positions"
+                self._write_decision_log(log_row)
+                logger.warning(
+                    f"🛑 [{sym}] 同時保有上限({MAX_CONCURRENT_POSITIONS}銘柄)に到達中のため、新規エントリーを見送ります。"
+                )
+                continue
+
+            # 💡 追加: このサイクル内で以降の銘柄を判定する際、今回これから送る注文も
+            # 「保有数」に数える(同一サイクル内の複数同時エントリーで上限を超えないようにする)。
+            # 実際の約定結果(拒否等)に関わらず先に加算する、安全側に倒した数え方。
+            concurrent_positions += 1
 
             direction_sign = 1.0 if act_direction > 0 else -1.0
 
