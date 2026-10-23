@@ -36,17 +36,37 @@ RAW_FIELD_SUFFIXES = ["open", "high", "low", "close", "spread", "ATR"]
 # 学習ターゲット列は "close" 等のサフィックスに偶然マッチしてしまうため、
 # 明示的に除外する（portfolio_dataset.py の exclude_exact と揺えてある）。
 RAW_FIELD_EXCLUDE = {"future_close", "price_diff_pct", "target_class", "target_risk_pct"}
+
+# 💡 追加(2026-10-23の検証で判明した問題への対応): precompute_portfolio.py /
+# portfolio_env.py / train_portfolio_rl.py 等、システム全体がこの7銘柄固定での
+# 動作を前提にしている。以前はglobで見つかった銘柄数が1つ以上あれば(たとう7銘柄中
+# 1つでも欠けていても)無言で統合処理を続行してしまい、欠けた銘柄は観測上
+p等rob=0/risk=0 として扱われ続ける(.get()のデフォルト値のため例外も出ない)という、
+# 気づきにくい不具合があった。統合前に銘柄が揃っているかを明示的に検証する。
+EXPECTED_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
  
  
 def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "portfolio_merged_data.csv",phase = "train"):
     setup_logger()
-    logging.info("merge_portfolio_data.py ver208.4")
+    logging.info("merge_portfolio_data.py ver209.0")
     output_file = f"portfolio_merged_data_{phase}.csv"
  
     csv_paths = glob.glob(os.path.join(csv_dir,f"*_{mode}_scaled_{phase}.csv"))
  
     if not csv_paths:
         logging.error(f"指定されたディレクトリが見つかりません。")
+        return
+
+    found_symbols = sorted({os.path.basename(p).split("_")[0] for p in csv_paths})
+    missing_symbols = [s for s in EXPECTED_SYMBOLS if s not in found_symbols]
+    if missing_symbols:
+        logging.error(
+            f"❌ 以下の銘柄のデータが見つからないため、統合処理を中止します: {missing_symbols}"
+            f"(見つかった銘柄: {found_symbols})"
+        )
+        logging.error(
+            "split_data.py の実行状況・labeled_data フォルダの同期状況を確認してから再実行してください。"
+        )
         return
     
     logging.info(f"{len(csv_paths)}銘柄データを統合します")

@@ -55,7 +55,7 @@ def calculate_auto_class_weights(csv_paths, method="sqrt", device="cpu", sample_
         labels = (df["target_class"] + 1).tolist()
 
         # 2. 全体を読み込むのではなく、時系列の偏りを防ぐために等間隔でサンプリングする
-        # 例: sample_ratio=0.2 なら、5行に1行のペースで抽出（時系列の傾向は維持される）
+        # 例: sample_ratio=0.2 なら【5行に1行のペースで抽出（時系列の傾向は維持される）
         step = max(1, int(1 / sample_ratio))
         sampled_labels = labels[::step]
 
@@ -91,7 +91,7 @@ def calculate_auto_class_weights(csv_paths, method="sqrt", device="cpu", sample_
     avg_weights = np.mean(per_symbol_weights, axis=0).tolist()
 
     print(f"\n--- 自動重み計算 ({method} mode, 銘柄別に計算して平均, サンプリング率: {sample_ratio*100}%) ---")
-    print(f"適用される正規化ウェイト(銘柄平均): SELL={avg_weights[0]:.4f}, HOLD={avg_weights[1]:.4f}, BUY={avg_weights[2]:.4f}\n")
+    print(f"適用される正規化ウエイト(銘柄平均): SELL={avg_weights[0]:.4f}, HOLD={avg_weights[1]:.4f}, BUY={avg_weights[2]:.4f}\n")
 
     return torch.tensor(avg_weights, dtype=torch.float32).to(device)
 
@@ -189,37 +189,6 @@ class ScaledFXDataset(torch.utils.data.Dataset):
             scaled_risk = torch.tensor((risk - self.mean) / self.std, dtype=torch.float32)
         return img, tab, cls, scaled_risk, symbol_id
 
-def filter_valid_data(csv_path, img_dir):
-    """
-    画像ファイルが実際に存在するかを全件チェックし、
-    画像がない行（欠損データ）を安全に除外した新しいCSVを生成する関数
-    """
-    df = pd.read_csv(csv_path)
-    
-    logging.info(f"⏳ 画像の欠損チェック中: {csv_path} ...")
-    
-    # 時刻から画像ファイル名をシミュレーションして、実際の存在をチェック
-    time_strs = pd.to_datetime(df['time']).dt.strftime("%Y%m%d_%H%M%S")
-    valid_mask = [os.path.exists(os.path.join(img_dir, f"{t}.png")) for t in time_strs]
-    
-    valid_count = sum(valid_mask)
-    missing_count = len(df) - valid_count
-    
-    # 欠損が1枚もなければ、元のCSVパスをそのまま返す
-    if missing_count == 0:
-        logging.info("✅ 欠損画像なし。完全なデータセットです。")
-        return csv_path
-        
-    # 欠損がある場合は、画像が存在する行（Trueの行）だけを抽出する
-    logging.warning(f"⚠️ {missing_count}件の画像欠損を検出！数値とのズレを防ぐため、該当行をスキップした安全なCSVを生成します。")
-    filtered_df = df[valid_mask]
-    
-    # 「_valid」と名前をつけた新しいCSVとして保存する
-    valid_csv_path = csv_path.replace(".csv", "_valid.csv")
-    filtered_df.to_csv(valid_csv_path, index=False)
-    
-    return valid_csv_path
-
 def main():
     setup_logger()
     parser = argparse.ArgumentParser(description="FX Multiple training with date range")
@@ -244,7 +213,21 @@ def main():
     if not csv_files:
         logging.error(f"No scaled data found for mode: {args.mode}")
         return
-    
+
+    # 💡 追加(2026-10-23の検証で判明した問題への対応): 以前はglobで1件でも
+    # 見つかれば(7銘柄中いくつ欠けていても)無言で学習を続行してしまっていた。
+    # ポートフォリオ側(precompute_portfolio.py等)と同じ7銘柄を期待値として明示し、
+    # 欠けている銘柄があればここで気づけるようにする。
+    EXPECTED_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
+    found_symbols = sorted({os.path.basename(p).split("_")[0] for p in csv_files})
+    missing_symbols = [s for s in EXPECTED_SYMBOLS if s not in found_symbols]
+    if missing_symbols:
+        logging.error(
+            f"❌ 以下の銘柄のデータが見つからないため、学習を中止します: {missing_symbols}"
+            f"(見つかった銘柄: {found_symbols})"
+        )
+        return
+
     train_datasets = []
     val_datasets = []
     scaler_info = {}
@@ -256,6 +239,11 @@ def main():
 
     # DataFrameのカラム数を取得するために、最初の有効なデータセットから input_dim を計算する用
     first_train_df = None
+
+    # 💡 追加(2026-10-23の検証で判明した問題への対応): CSVは見つかったが、画像フォルダが
+    # 無い等の理由で結局その銘柄のデータが1件も使えなかった場合を追跡する。
+    # 従来は "train_datasets が空(=全銘柄が失敗)" でなければ気づけなかった。
+    loaded_symbols = []
 
     for csv_path in csv_files:
         symbol = os.path.basename(csv_path).split("_")[0]
@@ -340,15 +328,27 @@ def main():
 
             if len(raw_tr_ds) > 0:
                 train_datasets.append(ScaledFXDataset(raw_tr_ds, risk_mean, risk_std))
+                loaded_symbols.append(symbol)
             if len(raw_val_ds) > 0:
                 val_datasets.append(ScaledFXDataset(raw_val_ds, risk_mean, risk_std))
 
             logging.info(f"Loaded {symbol}: Train={len(raw_tr_ds)}, Val={len(raw_val_ds)}, Test={len(test_df)}")
         except Exception as e:
             logging.error(f"Error loading {symbol}: {e}")
-            
+
     if not train_datasets:
         logging.error("No valid data loaded. Check date range of image paths.")
+        return
+
+    # 💡 追加(2026-10-23の検証で判明した問題への対応): CSVはあったが画像の問題等で
+    # 結局使えなかった銘柄が無いかを確認する。1銘柄でも欠けると、その銘柄を全く
+    # 見ないまま学習が完走してしまうため、黙って続行せず明示的に中止する。
+    missing_after_load = [s for s in EXPECTED_SYMBOLS if s not in loaded_symbols]
+    if missing_after_load:
+        logging.error(
+            f"❌ 以下の銘柄はCSVはあったものの、有効な学習データを1件も読み込めなかったため、"
+            f"学習を中止します: {missing_after_load}(画像フォルダの有無・内容を確認してください)"
+        )
         return
     
     
