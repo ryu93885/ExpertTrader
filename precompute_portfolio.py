@@ -36,8 +36,50 @@ def collate_fn_drop_none(batch):
         return None
     return dataloader.default_collate(batch)
 
+
+def check_images_complete(dataset, symbols, mode, img_dir):
+    """
+    💡 追加(2026-10-23の検証で判明した重大な問題への対応):
+    このあとの推論ループは画像を分析モデルに通し、その結果(prob_0/1/2・risk_val)を
+    CSVに焼き付ける。PortfolioFXDataset側は画像が欠損・破損していても例外を出さず
+    黒画像(ゼロテンソル)にフォールバックするため、画像展開(zip展開・rclone同期等)が
+    不完全な状態でこのスクリプトを実行すると、無意味な推論結果がエラーなくCSVに
+    書き込まれてしまう。しかもこのCSVは以降の学習・バックテストすべてで無条件に
+    信用されるため、一度汚染されると気づかれないまま使われ続ける。
+    そのため、実際に推論処理を始める前に、必要な画像がすべて揃っているかを検証する。
+    """
+    time_strs = dataset.df["time_str"].values
+    missing_by_symbol = {sym: [] for sym in symbols}
+    total_checked = 0
+    for idx in range(dataset.seq_length - 1, len(dataset)):
+        time_str = time_strs[idx]
+        for sym in symbols:
+            total_checked += 1
+            img_path = os.path.join(img_dir, sym, f"{mode}_MTF", f"{time_str}.png")
+            if not (os.path.exists(img_path) and os.path.getsize(img_path) > 0):
+                missing_by_symbol[sym].append(img_path)
+
+    total_missing = sum(len(v) for v in missing_by_symbol.values())
+    if total_missing == 0:
+        logging.info(f"✅ 画像の完全性チェックOK({total_checked}件すべて存在)。事前推論を開始します。")
+        return True
+
+    logging.error(f"❌ 画像が{total_missing}件(/{total_checked}件)欠損・破損しています。事前推論を中止します。")
+    for sym, paths in missing_by_symbol.items():
+        if paths:
+            logging.error(f"  [{sym}] {len(paths)}件欠損。例:")
+            for p in paths[:5]:
+                logging.error(f"    - {p}")
+    logging.error(
+        "画像展開(zip展開・rclone同期等)が完全に終わっているか確認してから再実行してください。"
+        "欠損を許容してでも続行したい場合は --allow-missing-images を付けてください"
+        "(その場合、該当箇所の精度は保証されません)。"
+    )
+    return False
+
+
 def main():
-    logging.info("precompute_portfolio.py ver209.1")
+    logging.info("precompute_portfolio.py ver210.0")
     # 💡 修正: 以前は "train" フェーズ専用に固定されており、test_portfolio.py が
     # 必要とする "portfolio_merged_data_test_with_preds.csv" を作る手段が存在しなかった。
     # (merge_portfolio_data.py は train/test 両方を出力するのに、precompute側が
@@ -45,6 +87,8 @@ def main():
     parser = argparse.ArgumentParser(description="ポートフォリオ用の事前推論(prob/risk列の追加)")
     parser.add_argument("--phase", type=str, default="train", choices=["train", "test"], help="対象フェーズ")
     parser.add_argument("--mode", type=str, default="short", choices=["short", "medium", "long"], help="対象モード")
+    parser.add_argument("--allow-missing-images", action="store_true",
+                         help="画像の欠損を検出しても処理を中止せず続行する(欠損箇所は黒画像で代替され、精度は保証されない)")
     args = parser.parse_args()
 
     symbols = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
@@ -59,6 +103,13 @@ def main():
 
     #1.preparing dataset and dataloader
     dataset = PortfolioFXDataset(merged_csv_path=merged_csv,base_img_dir = img_dir,symbols = symbols,mode = mode)
+
+    # 💡 追加: 推論前に画像の完全性を検証する(詳細はcheck_images_complete参照)。
+    images_ok = check_images_complete(dataset, symbols, mode, img_dir)
+    if not images_ok and not args.allow_missing_images:
+        logging.error("処理を中止しました。画像を揃えてから再実行してください。")
+        return
+
     dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=2, collate_fn=collate_fn_drop_none)
 
     #2.loading model

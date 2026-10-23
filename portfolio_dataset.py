@@ -10,7 +10,7 @@ import logging
 
 class PortfolioFXDataset(Dataset):
     def __init__(self,merged_csv_path,base_img_dir,symbols,mode = "short",seq_length = 40):
-        logging.info("portfolio_dataset.py ver208.2")
+        logging.info("portfolio_dataset.py ver209.0")
         self.df = pd.read_csv(merged_csv_path)
         self.base_img_dir = base_img_dir
         self.symbols = symbols
@@ -70,8 +70,13 @@ class PortfolioFXDataset(Dataset):
             try:
                 img = Image.open(img_path).convert("RGB")
                 img_tensor = self.transform(img)
-            except Exception:
-                # 【重要】特定の銘柄だけ休場等で画像がない場合、エラーで止めず黒画像（ゼロテンソル）を返す
+            except Exception as e:
+                # 💡 修正: 黒画像(ゼロテンソル)へのフォールバック自体は維持する(エラーで
+                # 処理全体を止めないため)が、無言のまま進むと precompute_portfolio.py の
+                # 出力に気づかれない汚染を生む(2026-10-23の検証で判明)。最低限ログに残す。
+                # 本来の防御線は precompute_portfolio.py 側の事前完全性チェック
+                # (check_images_complete)であり、ここに到達すること自体が想定外。
+                logging.warning(f"⚠️ 画像の読み込みに失敗したため黒画像で代替します: {img_path} ({e})")
                 img_tensor = torch.zeros((3, 224, 224), dtype=torch.float32)
             
             # 2. テーブル（時系列）データの読み込み
