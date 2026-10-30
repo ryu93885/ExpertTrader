@@ -1,4 +1,7 @@
 import argparse
+import sys
+import errno
+import time
 import torch
 from torch.utils.data import DataLoader,dataloader
 import pandas as pd
@@ -15,6 +18,13 @@ logging.basicConfig(level=logging.INFO,format = "%(asctime)s [%(levelname)s] %(m
 
 # 💡 追加: merge_portfolio_data.py と同じDrive保存先(永続化用)。
 DRIVE_PORTFOLIO_DATA_DIR = "/content/drive/MyDrive/FX_AI_Models/portfolio_data"
+
+# 💡 追加(2026-10-30の調査で判明した問題への対応): Google Drive(FUSEマウント)への
+# アデセスが集中すると、接続自体が切断されることがある(OSError: [Errno 107]
+# Transport endpoint is not connected / [Errno 5] Input/output error)。
+# 一時的な切断はリトリイで吸収する。
+DRIVE_IO_MAX_RETRIES = 5
+DRIVE_IO_RETRY_BACKOFF_BASE = 10  # 秒。リトリイ毎に倍増
 
 
 def backup_to_drive(local_path):
@@ -37,6 +47,30 @@ def collate_fn_drop_none(batch):
     return dataloader.default_collate(batch)
 
 
+def _scandir_with_retry(path):
+    """
+    💡 追加(2026-10-30): os.scandir()をリトライ付きで実行する。
+    Driveの接続が一時的に切れている場合(Errno 107/5)は待機して再試行し、
+    それ以外のエラー(フォルダが存在しない等)は即座に呼び出し元に伝える。
+    """
+    last_err = None
+    for attempt in range(DRIVE_IO_MAX_RETRIES):
+        try:
+            with os.scandir(path) as it:
+                return {entry.name: entry for entry in it}
+        except OSError as e:
+            if e.errno not in (errno.ENOTCONN, errno.EIO):
+                raise
+            last_err = e
+            wait = DRIVE_IO_RETRY_BACKOFF_BASE * (2 ** attempt)
+            logging.warning(
+                f"⚠️ Google Driveへの接続が一時的に切断されたようです({path}): {e}"
+                f" -- {wait}秒後に再試行します({attempt + 1}/{DRIVE_IO_MAX_RETRIES})"
+            )
+            time.sleep(wait)
+    raise last_err
+
+
 def check_images_complete(dataset, symbols, mode, img_dir):
     """
     💡 追加(2026-10-23の検証で判明した重大な問題への対応):
@@ -47,17 +81,46 @@ def check_images_complete(dataset, symbols, mode, img_dir):
     書き込まれてしまう。しかもこのCSVは以降の学習・バックテストすべてで無条件に
     信用されるため、一度汚染されると気づかれないまま使われ続ける。
     そのため、実際に推論処理を始める前に、必要な画像がすべて揃っているかを検証する。
+
+    💡 修正(2026-10-30の調査で判明した問題への対応): 以前は期待する全(時刻×銘柄)
+    ペアごとにos.path.exists()+os.path.getsize()を個別に呼んでいたため、mediumモード
+    の全期間では数十万回規模のDriveアクセスが発生していた。この規模の連続アクセスで
+    Google Drive(FUSEマウント)の接続自体が切断され(OSError: [Errno 107] Transport
+    endpoint is not connected)、このチェック自体がprecompute_portfolio.py全体を
+    クラッシュさせる事例が発生した。銘柄ごとに1回だけフォルダを列挙する方式に変更し、
+    個々の判定はメモリ上で行うことでDriveへのアクセス回数を大幅に削減する。
+    あわせて、一時的な切断はリトライで吸収し、復旧不能な場合は明示的なエラーとして
+    処理を中止する(無言のクラッシュにはしない)。
     """
-    time_strs = dataset.df["time_str"].values
+    time_strs_to_check = dataset.df["time_str"].values[dataset.seq_length - 1:]
     missing_by_symbol = {sym: [] for sym in symbols}
     total_checked = 0
-    for idx in range(dataset.seq_length - 1, len(dataset)):
-        time_str = time_strs[idx]
-        for sym in symbols:
+
+    for sym in symbols:
+        folder = os.path.join(img_dir, sym, f"{mode}_MTF")
+        try:
+            entries = _scandir_with_retry(folder)
+        except OSError as e:
+            logging.error(f"❌ 画像フォルダにアクセスできません: {folder} ({e})")
+            logging.error(
+                "Google Driveの接続切断、またはフォルダ自体が未展開であることが考えられます。"
+                "Googleドライブの再マウント・Colabランタイムの再起動、または"
+                "画像展開(zip展開・rclone同期等)の完了状況を確認してから再実行してください。"
+            )
+            return False
+
+        for time_str in time_strs_to_check:
             total_checked += 1
-            img_path = os.path.join(img_dir, sym, f"{mode}_MTF", f"{time_str}.png")
-            if not (os.path.exists(img_path) and os.path.getsize(img_path) > 0):
-                missing_by_symbol[sym].append(img_path)
+            filename = f"{time_str}.png"
+            entry = entries.get(filename)
+            is_present = False
+            if entry is not None:
+                try:
+                    is_present = entry.stat().st_size > 0
+                except OSError:
+                    is_present = False
+            if not is_present:
+                missing_by_symbol[sym].append(os.path.join(folder, filename))
 
     total_missing = sum(len(v) for v in missing_by_symbol.values())
     if total_missing == 0:
@@ -79,7 +142,7 @@ def check_images_complete(dataset, symbols, mode, img_dir):
 
 
 def main():
-    logging.info("precompute_portfolio.py ver210.0")
+    logging.info("precompute_portfolio.py ver211.0")
     # 💡 修正: 以前は "train" フェーズ専用に固定されており、test_portfolio.py が
     # 必要とする "portfolio_merged_data_test_with_preds.csv" を作る手段が存在しなかった。
     # (merge_portfolio_data.py は train/test 両方を出力するのに、precompute側が
@@ -108,7 +171,12 @@ def main():
     images_ok = check_images_complete(dataset, symbols, mode, img_dir)
     if not images_ok and not args.allow_missing_images:
         logging.error("処理を中止しました。画像を揃えてから再実行してください。")
-        return
+        # 💡 修正(2026-10-30): 以前はここが return のみだったため終了コードが0(正常終了)に
+        # なり、run_colab_pipeline.py の run_command() がこの中止を検出できず「✅ 完了」と
+        # 表示してそのまま後続処理に進んでしまっていた(結果、後続のステップが存在しない
+        # ファイルを参照して別のエラーで落ち、原因がわかりにくくなっていた)。
+        # sys.exit(1)で明示的に異常終了を伝える。
+        sys.exit(1)
 
     dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=2, collate_fn=collate_fn_drop_none)
 
@@ -149,7 +217,7 @@ def main():
                 all_probs[sym].extend(probs.tolist())
                 all_risks[sym].extend(risks.flatten().tolist())
 
-    #4.saving CSV 
+    #4.saving CSV
     df = pd.read_csv(merged_csv)
     for sym in symbols:
         df[f"{sym}_prob_0"] = [p[0] for p in all_probs[sym]]

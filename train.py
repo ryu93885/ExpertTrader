@@ -13,6 +13,7 @@ import json
 from PIL import Image
 import random
 import shutil
+import sys
 from torch.utils.data._utils.collate import default_collate
 
 from collections import Counter
@@ -55,7 +56,7 @@ def calculate_auto_class_weights(csv_paths, method="sqrt", device="cpu", sample_
         labels = (df["target_class"] + 1).tolist()
 
         # 2. 全体を読み込むのではなく、時系列の偏りを防ぐために等間隔でサンプリングする
-        # 例: sample_ratio=0.2 なら【5行に1行のペースで抽出（時系列の傾向は維持される）
+        # 例: sample_ratio=0.2 なら、5行に1行のペースで抽出（時系列の傾向は維持される）
         step = max(1, int(1 / sample_ratio))
         sampled_labels = labels[::step]
 
@@ -91,7 +92,7 @@ def calculate_auto_class_weights(csv_paths, method="sqrt", device="cpu", sample_
     avg_weights = np.mean(per_symbol_weights, axis=0).tolist()
 
     print(f"\n--- 自動重み計算 ({method} mode, 銘柄別に計算して平均, サンプリング率: {sample_ratio*100}%) ---")
-    print(f"適用される正規化ウエイト(銘柄平均): SELL={avg_weights[0]:.4f}, HOLD={avg_weights[1]:.4f}, BUY={avg_weights[2]:.4f}\n")
+    print(f"適用される正規化ウェイト(銘柄平均): SELL={avg_weights[0]:.4f}, HOLD={avg_weights[1]:.4f}, BUY={avg_weights[2]:.4f}\n")
 
     return torch.tensor(avg_weights, dtype=torch.float32).to(device)
 
@@ -216,7 +217,7 @@ def main():
 
     # 💡 追加(2026-10-23の検証で判明した問題への対応): 以前はglobで1件でも
     # 見つかれば(7銘柄中いくつ欠けていても)無言で学習を続行してしまっていた。
-    # ポートフォリオ側(precompute_portfolio.py等)と同じ7銘柄を期待値として明示し、
+    # ポートフォリオ側(precompute_portfolio.py等)と同じ7銘柄を期待値として明示し、
     # 欠けている銘柄があればここで気づけるようにする。
     EXPECTED_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
     found_symbols = sorted({os.path.basename(p).split("_")[0] for p in csv_files})
@@ -226,7 +227,10 @@ def main():
             f"❌ 以下の銘柄のデータが見つからないため、学習を中止します: {missing_symbols}"
             f"(見つかった銘柄: {found_symbols})"
         )
-        return
+        # 💡 修正(2026-10-30): return のみだと終了コードが0になり、run_colab_pipeline.py
+        # がこの中止を検出できず後続処理に進んでしまうため、sys.exit(1)で明示的に
+        # 異常終了を伝える。
+        sys.exit(1)
 
     train_datasets = []
     val_datasets = []
@@ -349,7 +353,8 @@ def main():
             f"❌ 以下の銘柄はCSVはあったものの、有効な学習データを1件も読み込めなかったため、"
             f"学習を中止します: {missing_after_load}(画像フォルダの有無・内容を確認してください)"
         )
-        return
+        # 💡 修正(2026-10-30): 同上の理由でsys.exit(1)に変更。
+        sys.exit(1)
     
     
     with open(f"saved_models/risk_scalers_{args.mode}.json", "w") as f:

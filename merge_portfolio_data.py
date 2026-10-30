@@ -5,6 +5,7 @@ import glob
 import logging
 import argparse
 import shutil
+import sys
 
 # 💡 追加: Colabのローカルディスクはセッション切断で消えるため、生成した統合データは
 # 必ずここにもコピーして永続化する(run_colab_pipeline.py の復元ロジックと対になる)。
@@ -34,28 +35,34 @@ def backup_to_drive(local_path):
 RAW_FIELD_SUFFIXES = ["open", "high", "low", "close", "spread", "ATR"]
  
 # 学習ターゲット列は "close" 等のサフィックスに偶然マッチしてしまうため、
-# 明示的に除外する（portfolio_dataset.py の exclude_exact と揺えてある）。
+# 明示的に除外する（portfolio_dataset.py の exclude_exact と揃えてある）。
 RAW_FIELD_EXCLUDE = {"future_close", "price_diff_pct", "target_class", "target_risk_pct"}
 
 # 💡 追加(2026-10-23の検証で判明した問題への対応): precompute_portfolio.py /
 # portfolio_env.py / train_portfolio_rl.py 等、システム全体がこの7銘柄固定での
-# 動作を前提にしている。以前はglobで見つかった銘柄数が1つ以上あれば(たとう7銘柄中
+# 動作を前提にしている。以前はglobで見つかった銘柄数が1つ以上あれば(たとえ7銘柄中
 # 1つでも欠けていても)無言で統合処理を続行してしまい、欠けた銘柄は観測上
-p等rob=0/risk=0 として扱われ続ける(.get()のデフォルト値のため例外も出ない)という、
+# prob=0/risk=0 として扱われ続ける(.get()のデフォルト値のため例外も出ない)という、
 # 気づきにくい不具合があった。統合前に銘柄が揃っているかを明示的に検証する。
 EXPECTED_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
- 
- 
+
+
 def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "portfolio_merged_data.csv",phase = "train"):
     setup_logger()
-    logging.info("merge_portfolio_data.py ver209.0")
+    logging.info("merge_portfolio_data.py ver210.0")
     output_file = f"portfolio_merged_data_{phase}.csv"
- 
+
     csv_paths = glob.glob(os.path.join(csv_dir,f"*_{mode}_scaled_{phase}.csv"))
- 
+
+    # 💡 修正(2026-10-30): 以前はここが return のみだったため終了コードが0(正常終了)に
+    # なり、run_colab_pipeline.py の run_command() がこの中止を検出できず「✅ 完了」と
+    # 表示してそのまま後続処理(precompute_portfolio.py等)に進んでしまっていた。
+    # その結果、後続処理が存在しないportfolio_merged_data_{phase}.csvを読もうとして
+    # 別のエラーで落ち、本当の原因(ここでの中止)がわかりにくくなっていた。
+    # sys.exit(1)で明示的に異常終了を伝える。
     if not csv_paths:
         logging.error(f"指定されたディレクトリが見つかりません。")
-        return
+        sys.exit(1)
 
     found_symbols = sorted({os.path.basename(p).split("_")[0] for p in csv_paths})
     missing_symbols = [s for s in EXPECTED_SYMBOLS if s not in found_symbols]
@@ -67,8 +74,8 @@ def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "
         logging.error(
             "split_data.py の実行状況・labeled_data フォルダの同期状況を確認してから再実行してください。"
         )
-        return
-    
+        sys.exit(1)
+
     logging.info(f"{len(csv_paths)}銘柄データを統合します")
  
     all_dfs = {}
