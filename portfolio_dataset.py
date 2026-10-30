@@ -3,15 +3,50 @@ from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
 import os
+import errno
+import time
 from PIL import Image
 import torchvision.transforms as transforms
 import logging
 
+# 💡 追加(2026-10-30の調査で判明した問題への対応): Google Drive(FUSEマウント)への
+# アデセスが集中・長時間化すると、接続自体が切断されることがある(OSError: [Errno 107]
+# Transport endpoint is not connected / [Errno 5] Input/output error)。
+# 一時的な切断はリトリイで吸収する。
+DRIVE_IO_MAX_RETRIES = 5
+DRIVE_IO_RETRY_BACKOFF_BASE = 10  # 秒。リトリイ毎に倍増
+
+
+def _read_csv_with_drive_retry(path, **kwargs):
+    """
+    💡 追加(2026-10-30の調査で判明した問題への対応): merge_portfolio_data.py が生成する
+    portfolio_merged_data_{phase}.csv(数十MB規模)をGoogle Drive(FUSEマウント)上から
+    読み込む途中で接続が切断されると、pandasの内部で例外処理中にさらに同じ例外が発生し
+    (OSError: [Errno 107])、生の二重例外としてprecompute_portfolio.py全体が
+    クラッシュする事例が発生した。一時的な切断はリトリイ(最大5回, 指数バックオフ)で吸収し、
+    復旧不能な場合はそのまま例外を呼び出し元に伝える。
+    """
+    last_err = None
+    for attempt in range(DRIVE_IO_MAX_RETRIES):
+        try:
+            return pd.read_csv(path, **kwargs)
+        except OSError as e:
+            if e.errno not in (errno.ENOTCONN, errno.EIO):
+                raise
+            last_err = e
+            wait = DRIVE_IO_RETRY_BACKOFF_BASE * (2 ** attempt)
+            logging.warning(
+                f"⚠️ Google Driveへの接続が一時的に切断されたようです({path}): {e}"
+                f" -- {wait}秒後に再試行します({attempt + 1}/{DRIVE_IO_MAX_RETRIES})"
+            )
+            time.sleep(wait)
+    raise last_err
+
 
 class PortfolioFXDataset(Dataset):
     def __init__(self,merged_csv_path,base_img_dir,symbols,mode = "short",seq_length = 40):
-        logging.info("portfolio_dataset.py ver209.0")
-        self.df = pd.read_csv(merged_csv_path)
+        logging.info("portfolio_dataset.py ver210.0")
+        self.df = _read_csv_with_drive_retry(merged_csv_path)
         self.base_img_dir = base_img_dir
         self.symbols = symbols
         self.mode = mode
@@ -94,5 +129,3 @@ class PortfolioFXDataset(Dataset):
         tabs_tensor = torch.stack(tabs_list)
         
         return imgs_tensor, tabs_tensor
-
-        

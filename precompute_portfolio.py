@@ -47,28 +47,36 @@ def collate_fn_drop_none(batch):
     return dataloader.default_collate(batch)
 
 
-def _scandir_with_retry(path):
+def _with_drive_retry(func, *args, **kwargs):
     """
-    💡 追加(2026-10-30): os.scandir()をリトライ付きで実行する。
-    Driveの接続が一時的に切れている場合(Errno 107/5)は待機して再試行し、
-    それ以外のエラー(フォルダが存在しない等)は即座に呼び出し元に伝える。
+    💡 追加(2026-10-30の調査で判明した問題への対応): Google Drive(FUSEマウント)上の
+    ファイルを読み書きする呼び出し(pd.read_csv・torch.load・os.scandir・to_csv等)を、
+    一時的な接続切断(OSError: [Errno 107] Transport endpoint is not connected /
+    [Errno 5] Input/output error)に対してリトリイする汎用リーパー。
+    実際に、この種の切断が原因でCSV読み込み中にprecompute_portfolio.py全体が
+    クラッシュする事例が発生した(pandasが例外処理中にさらに同じ例外を出し、
+    二重例外として生のまま落ちていた)。それ以外のエラーは即座に呼び出し元に伝える。
     """
     last_err = None
     for attempt in range(DRIVE_IO_MAX_RETRIES):
         try:
-            with os.scandir(path) as it:
-                return {entry.name: entry for entry in it}
+            return func(*args, **kwargs)
         except OSError as e:
             if e.errno not in (errno.ENOTCONN, errno.EIO):
                 raise
             last_err = e
             wait = DRIVE_IO_RETRY_BACKOFF_BASE * (2 ** attempt)
             logging.warning(
-                f"⚠️ Google Driveへの接続が一時的に切断されたようです({path}): {e}"
+                f"⚠️ Google Driveへの接続が一時的に切断されたようです: {e}"
                 f" -- {wait}秒後に再試行します({attempt + 1}/{DRIVE_IO_MAX_RETRIES})"
             )
             time.sleep(wait)
     raise last_err
+
+
+def _list_dir_entries(path):
+    with os.scandir(path) as it:
+        return {entry.name: entry for entry in it}
 
 
 def check_images_complete(dataset, symbols, mode, img_dir):
@@ -89,7 +97,7 @@ def check_images_complete(dataset, symbols, mode, img_dir):
     endpoint is not connected)、このチェック自体がprecompute_portfolio.py全体を
     クラッシュさせる事例が発生した。銘柄ごとに1回だけフォルダを列挙する方式に変更し、
     個々の判定はメモリ上で行うことでDriveへのアクセス回数を大幅に削減する。
-    あわせて、一時的な切断はリトライで吸収し、復旧不能な場合は明示的なエラーとして
+    あわせて、一時的な切断はリトリイで吸収し、復旧不能な場合は明示的なエラーとして
     処理を中止する(無言のクラッシュにはしない)。
     """
     time_strs_to_check = dataset.df["time_str"].values[dataset.seq_length - 1:]
@@ -99,7 +107,7 @@ def check_images_complete(dataset, symbols, mode, img_dir):
     for sym in symbols:
         folder = os.path.join(img_dir, sym, f"{mode}_MTF")
         try:
-            entries = _scandir_with_retry(folder)
+            entries = _with_drive_retry(_list_dir_entries, folder)
         except OSError as e:
             logging.error(f"❌ 画像フォルダにアクセスできません: {folder} ({e})")
             logging.error(
@@ -142,7 +150,7 @@ def check_images_complete(dataset, symbols, mode, img_dir):
 
 
 def main():
-    logging.info("precompute_portfolio.py ver211.0")
+    logging.info("precompute_portfolio.py ver212.0")
     # 💡 修正: 以前は "train" フェーズ専用に固定されており、test_portfolio.py が
     # 必要とする "portfolio_merged_data_test_with_preds.csv" を作る手段が存在しなかった。
     # (merge_portfolio_data.py は train/test 両方を出力するのに、precompute側が
@@ -183,7 +191,10 @@ def main():
     #2.loading model
     input_dim = len(dataset.feature_cols[symbols[0]])
     model = MultimodalFXmodel(num_tabular_features=input_dim).to(device)
-    model.load_state_dict(torch.load(model_path,map_location = device,weights_only=False)["model_state_dict"])
+    # 💡 修正(2026-10-30): モデル重みもDrive上のファイルであり、同じErrno 107/5の
+    # リスクがあるため、_with_drive_retryで読み込む。
+    checkpoint = _with_drive_retry(torch.load, model_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     #3.listing result of prediction
@@ -218,13 +229,15 @@ def main():
                 all_risks[sym].extend(risks.flatten().tolist())
 
     #4.saving CSV
-    df = pd.read_csv(merged_csv)
+    # 💡 修正(2026-10-30): mergeされたCSVの再読み込み・結果の書き出しも同じDrive上の
+    # 操作であり、Errno 107/5のリスクがあるため、_with_drive_retryで実行する。
+    df = _with_drive_retry(pd.read_csv, merged_csv)
     for sym in symbols:
         df[f"{sym}_prob_0"] = [p[0] for p in all_probs[sym]]
         df[f"{sym}_prob_1"] = [p[1] for p in all_probs[sym]]
         df[f"{sym}_prob_2"] = [p[2] for p in all_probs[sym]]
         df[f"{sym}_risk_val"] = all_risks[sym]
-    df.to_csv(output_csv, index=False)
+    _with_drive_retry(df.to_csv, output_csv, index=False)
     logging.info(f"✨ 事前推論完了！ {output_csv} に保存しました。")
     backup_to_drive(output_csv)
 
