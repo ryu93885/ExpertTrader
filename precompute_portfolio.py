@@ -74,83 +74,73 @@ def _with_drive_retry(func, *args, **kwargs):
     raise last_err
 
 
-def _list_dir_entries(path):
-    with os.scandir(path) as it:
-        return {entry.name: entry for entry in it}
-
-
-def check_images_complete(dataset, symbols, mode, img_dir):
+def check_images_complete(dataset, symbols, max_missing_pct, allow_missing_images):
     """
     💡 追加(2026-10-23の検証で判明した重大な問題への対応):
     このあとの推論ループは画像を分析モデルに通し、その結果(prob_0/1/2・risk_val)を
-    CSVに焼き付ける。PortfolioFXDataset側は画像が欠損・破損していても例外を出さず
-    黒画像(ゼロテンソル)にフォールバックするため、画像展開(zip展開・rclone同期等)が
-    不完全な状態でこのスクリプトを実行すると、無意味な推論結果がエラーなくCSVに
-    書き込まれてしまう。しかもこのCSVは以降の学習・バックテストすべてで無条件に
-    信用されるため、一度汚染されると気づかれないまま使われ続ける。
-    そのため、実際に推論処理を始める前に、必要な画像がすべて揃っているかを検証する。
+    CSVに焼き付ける。画像が欠損・破損した状態で推論すると、気づかれないまま汚染された
+    CSVが生成され、以降の学習・バックテストすべてで無条件に信用されてしまう。そのため、
+    実際に推論を始める前に、画像の欠損状況を検証し、閾値を超える場合は明示的に中止する。
 
-    💡 修正(2026-10-30の調査で判明した問題への対応): 以前は期待する全(時刻×銘柄)
-    ペアごとにos.path.exists()+os.path.getsize()を個別に呼んでいたため、mediumモード
-    の全期間では数十万回規模のDriveアクセスが発生していた。この規模の連続アクセスで
-    Google Drive(FUSEマウント)の接続自体が切断され(OSError: [Errno 107] Transport
-    endpoint is not connected)、このチェック自体がprecompute_portfolio.py全体を
-    クラッシュさせる事例が発生した。銘柄ごとに1回だけフォルダを列挙する方式に変更し、
-    個々の判定はメモリ上で行うことでDriveへのアクセス回数を大幅に削減する。
-    あわせて、一時的な切断はリトリイで吸収し、復旧不能な場合は明示的なエラーとして
-    処理を中止する(無言のクラッシュにはしない)。
+    💡 修正(2026-10-31の調査で判明した問題への対応): 画像の列挙・欠損判定自体は
+    PortfolioFXDataset.__init__ 側(_resolve_image_paths)に一本化した(Driveへの
+    スキャンをここで重複させないため)。ここではその結果(dataset.missing_image_info)を
+    読んで、銘柄ごとの欠損率が閾値(max_missing_pct)を超えるかどうかだけを判断する。
+    閾値未満の欠損は、データセット側で直前/直後の実在画像に自動的に解決されている
+    (銘柄ごとの取引カレンダーの違い等による、ごく少数の避けられない欠損を想定)ため、
+    警告のみで続行する。閾値以上の欠損は、--allow-missing-images が明示されない限り
+    中止する(原因調査には diagnose_missing_images.py を使う)。
     """
-    time_strs_to_check = dataset.df["time_str"].values[dataset.seq_length - 1:]
-    missing_by_symbol = {sym: [] for sym in symbols}
-    total_checked = 0
-
+    any_blocking = False
     for sym in symbols:
-        folder = os.path.join(img_dir, sym, f"{mode}_MTF")
-        try:
-            entries = _with_drive_retry(_list_dir_entries, folder)
-        except OSError as e:
-            logging.error(f"❌ 画像フォルダにアクセスできません: {folder} ({e})")
-            logging.error(
-                "Google Driveの接続切断、またはフォルダ自体が未展開であることが考えられます。"
-                "Googleドライブの再マウント・Colabランタイムの再起動、または"
-                "画像展開(zip展開・rclone同期等)の完了状況を確認してから再実行してください。"
+        info = dataset.missing_image_info[sym]
+        total = info["total"]
+        missing = info["missing_count"]
+        pct = missing / total * 100 if total else 0.0
+
+        if missing == 0:
+            logging.info(f"✅ [{sym}] 画像の完全性チェックOK({total}件すべて存在)。")
+            continue
+
+        if pct < max_missing_pct:
+            logging.warning(
+                f"⚠️ [{sym}] 画像が{missing}件(/{total}件, {pct:.3f}%)欠損していますが、"
+                f"閾値({max_missing_pct}%)未満のため、直前/直後の実在画像を使い回して続行します。"
             )
-            return False
+            for p in info["examples"]:
+                logging.warning(f"    - {p}")
+            continue
 
-        for time_str in time_strs_to_check:
-            total_checked += 1
-            filename = f"{time_str}.png"
-            entry = entries.get(filename)
-            is_present = False
-            if entry is not None:
-                try:
-                    is_present = entry.stat().st_size > 0
-                except OSError:
-                    is_present = False
-            if not is_present:
-                missing_by_symbol[sym].append(os.path.join(folder, filename))
+        any_blocking = True
+        logging.error(
+            f"❌ [{sym}] 画像が{missing}件(/{total}件, {pct:.3f}%)欠損しており、"
+            f"閾値({max_missing_pct}%)を超えています。"
+        )
+        for p in info["examples"]:
+            logging.error(f"    - {p}")
 
-    total_missing = sum(len(v) for v in missing_by_symbol.values())
-    if total_missing == 0:
-        logging.info(f"✅ 画像の完全性チェックOK({total_checked}件すべて存在)。事前推論を開始します。")
+    if not any_blocking:
+        logging.info("事前推論を開始します。")
         return True
 
-    logging.error(f"❌ 画像が{total_missing}件(/{total_checked}件)欠損・破損しています。事前推論を中止します。")
-    for sym, paths in missing_by_symbol.items():
-        if paths:
-            logging.error(f"  [{sym}] {len(paths)}件欠損。例:")
-            for p in paths[:5]:
-                logging.error(f"    - {p}")
+    if allow_missing_images:
+        logging.warning(
+            "⚠️ 閾値を超える欠損がありますが、--allow-missing-images が指定されているため、"
+            "直前/直後の実在画像を使い回して続行します(該当箇所の精度は保証されません)。"
+        )
+        return True
+
     logging.error(
-        "画像展開(zip展開・rclone同期等)が完全に終わっているか確認してから再実行してください。"
-        "欠損を許容してでも続行したい場合は --allow-missing-images を付けてください"
-        "(その場合、該当箇所の精度は保証されません)。"
+        "画像展開(zip展開・rclone同期等)が完全に終わっているか確認するか、"
+        "diagnose_missing_images.py で原因(特定期間への集中か、ランダムな欠落か等)を"
+        "調査してから再実行してください。欠損を許容してでも続行したい場合は"
+        "--allow-missing-images を付けてください(その場合、該当箇所の精度は保証されません)。"
     )
     return False
 
 
 def main():
-    logging.info("precompute_portfolio.py ver212.0")
+    logging.info("precompute_portfolio.py ver213.0")
     # 💡 修正: 以前は "train" フェーズ専用に固定されており、test_portfolio.py が
     # 必要とする "portfolio_merged_data_test_with_preds.csv" を作る手段が存在しなかった。
     # (merge_portfolio_data.py は train/test 両方を出力するのに、precompute側が
@@ -159,7 +149,12 @@ def main():
     parser.add_argument("--phase", type=str, default="train", choices=["train", "test"], help="対象フェーズ")
     parser.add_argument("--mode", type=str, default="short", choices=["short", "medium", "long"], help="対象モード")
     parser.add_argument("--allow-missing-images", action="store_true",
-                         help="画像の欠損を検出しても処理を中止せず続行する(欠損箇所は黒画像で代替され、精度は保証されない)")
+                         help="--max-missing-pctを超える画像欠損を検出しても処理を中止せず続行する"
+                              "(欠損箇所は直前/直後の実在画像で代替され、精度は保証されない)")
+    parser.add_argument("--max-missing-pct", type=float, default=0.1,
+                         help="銘柄ごとの画像欠損率がこの値(%%)未満であれば、自動的に直前/直後の"
+                              "実在画像で解決して続行する(デフォルト0.1%%。銘柄間の取引カレンダーの"
+                              "違い等による、ごく少数の避けられない欠損を許容するための閾値)")
     args = parser.parse_args()
 
     symbols = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
@@ -176,8 +171,8 @@ def main():
     dataset = PortfolioFXDataset(merged_csv_path=merged_csv,base_img_dir = img_dir,symbols = symbols,mode = mode)
 
     # 💡 追加: 推論前に画像の完全性を検証する(詳細はcheck_images_complete参照)。
-    images_ok = check_images_complete(dataset, symbols, mode, img_dir)
-    if not images_ok and not args.allow_missing_images:
+    images_ok = check_images_complete(dataset, symbols, args.max_missing_pct, args.allow_missing_images)
+    if not images_ok:
         logging.error("処理を中止しました。画像を揃えてから再実行してください。")
         # 💡 修正(2026-10-30): 以前はここが return のみだったため終了コードが0(正常終了)に
         # なり、run_colab_pipeline.py の run_command() がこの中止を検出できず「✅ 完了」と

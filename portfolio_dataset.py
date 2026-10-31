@@ -17,36 +17,39 @@ DRIVE_IO_MAX_RETRIES = 5
 DRIVE_IO_RETRY_BACKOFF_BASE = 10  # 秒。リトリイ毎に倍増
 
 
-def _read_csv_with_drive_retry(path, **kwargs):
+def _with_drive_retry(func, *args, **kwargs):
     """
-    💡 追加(2026-10-30の調査で判明した問題への対応): merge_portfolio_data.py が生成する
-    portfolio_merged_data_{phase}.csv(数十MB規模)をGoogle Drive(FUSEマウント)上から
-    読み込む途中で接続が切断されると、pandasの内部で例外処理中にさらに同じ例外が発生し
-    (OSError: [Errno 107])、生の二重例外としてprecompute_portfolio.py全体が
-    クラッシュする事例が発生した。一時的な切断はリトリイ(最大5回, 指数バックオフ)で吸収し、
-    復旧不能な場合はそのまま例外を呼び出し元に伝える。
+    💡 追加(2026-10-30/31の調査で判明した問題への対応): Google Drive(FUSEマウント)上の
+    ファイルを読み書きする呼び出し(pd.read_csv・os.scandir等)を、一時的な接続切断
+    (OSError: [Errno 107] Transport endpoint is not connected / [Errno 5] Input/output
+    error)に対してリトリイする汎用リーパー。それ以外のエラーは即座に呼び出し元に伝える。
     """
     last_err = None
     for attempt in range(DRIVE_IO_MAX_RETRIES):
         try:
-            return pd.read_csv(path, **kwargs)
+            return func(*args, **kwargs)
         except OSError as e:
             if e.errno not in (errno.ENOTCONN, errno.EIO):
                 raise
             last_err = e
             wait = DRIVE_IO_RETRY_BACKOFF_BASE * (2 ** attempt)
             logging.warning(
-                f"⚠️ Google Driveへの接続が一時的に切断されたようです({path}): {e}"
+                f"⚠️ Google Driveへの接続が一時的に切断されたようです: {e}"
                 f" -- {wait}秒後に再試行します({attempt + 1}/{DRIVE_IO_MAX_RETRIES})"
             )
             time.sleep(wait)
     raise last_err
 
 
+def _list_dir_entries(path):
+    with os.scandir(path) as it:
+        return {entry.name: entry for entry in it}
+
+
 class PortfolioFXDataset(Dataset):
     def __init__(self,merged_csv_path,base_img_dir,symbols,mode = "short",seq_length = 40):
-        logging.info("portfolio_dataset.py ver210.0")
-        self.df = _read_csv_with_drive_retry(merged_csv_path)
+        logging.info("portfolio_dataset.py ver211.0")
+        self.df = _with_drive_retry(pd.read_csv, merged_csv_path)
         self.base_img_dir = base_img_dir
         self.symbols = symbols
         self.mode = mode
@@ -86,6 +89,76 @@ class PortfolioFXDataset(Dataset):
         self.df["time_str"] = pd.to_datetime(self.df["time"]).dt.strftime("%Y%m%d_%H%M%S")
         logging.info(f"Portfolio Dataset 初期化完了: {len(self.symbols)}銘柄, 総ステップ数: {len(self.df)}")
 
+        # 💡 追加(2026-10-31の調査で判明した問題への対応): 銘柄ごとの取引カレンダーの違い
+        # 等により、一部の時刻でその銘柄の画像が存在しない行が生じる(merge_portfolio_data.py
+        # のマスタータイムラインは全銘柄の時刻の和集合のため)。従来は黒画像(ゼロテンソル)で
+        # 代替していたが、これは情報をゼロにしてしまう。表データ側は同じ種類の欠損を既に
+        # ffill(直前値で埋める)で扱っているため、画像側も同じ考え方に揃え、直前(無ければ
+        # 直後)の実在する画像を使い回す。__init__時点で銘柄ごとに1回だけフォルダを列挙し、
+        # 全行分の解決済みパスを事前計算する(precompute_portfolio.py側の完全性チェックとも
+        # この結果を共有し、Driveへの再スキャンを避ける)。
+        self._resolve_image_paths()
+
+    def _resolve_image_paths(self):
+        self.resolved_img_paths = {}
+        self.missing_image_info = {}
+
+        time_strs = self.df["time_str"].values
+
+        for sym in self.symbols:
+            folder = os.path.join(self.base_img_dir, sym, f"{self.mode}_MTF")
+            try:
+                entries = _with_drive_retry(_list_dir_entries, folder)
+            except OSError as e:
+                logging.error(f"❌ 画像フォルダにアクセスできません: {folder} ({e})")
+                entries = {}
+
+            paths = [None] * len(time_strs)
+            was_real = [False] * len(time_strs)
+            missing_idx = []
+
+            for i, time_str in enumerate(time_strs):
+                filename = f"{time_str}.png"
+                entry = entries.get(filename)
+                is_present = False
+                if entry is not None:
+                    try:
+                        is_present = entry.stat().st_size > 0
+                    except OSError:
+                        is_present = False
+                if is_present:
+                    paths[i] = os.path.join(folder, filename)
+                    was_real[i] = True
+                else:
+                    missing_idx.append(i)
+
+            # 前方補完(ffill): 直前の「実在する」画像のパスで埋める
+            last_valid = None
+            for i in range(len(paths)):
+                if was_real[i]:
+                    last_valid = paths[i]
+                elif last_valid is not None:
+                    paths[i] = last_valid
+
+            # 後方補完(bfill): 先頭近くで前方補完すら効かなかった行を、直後の
+            # 「実在する」画像のパスで埋める(was_realは元の実在判定のまま固定なので、
+            # ffillで書き込まれた値を誤ってアンカーにすることはない)
+            next_valid = None
+            for i in range(len(paths) - 1, -1, -1):
+                if was_real[i]:
+                    next_valid = paths[i]
+                elif paths[i] is None and next_valid is not None:
+                    paths[i] = next_valid
+
+            self.resolved_img_paths[sym] = paths
+            self.missing_image_info[sym] = {
+                "missing_count": len(missing_idx),
+                "total": len(paths),
+                "examples": [
+                    os.path.join(folder, f"{time_strs[i]}.png") for i in missing_idx[:5]
+                ],
+            }
+
     def __len__(self):
         return len(self.df)
 
@@ -97,20 +170,21 @@ class PortfolioFXDataset(Dataset):
         imgs_list = []
         tabs_list = []
         
-        time_str = self.df.iloc[idx]["time_str"]
-        
         for sym in self.symbols:
-            # 1. 画像データの読み込み
-            img_path = os.path.join(self.base_img_dir, sym, f"{self.mode}_MTF", f"{time_str}.png")
+            # 1. 画像データの読み込み(__init__で解決済みのパスを使う。詳細は
+            # _resolve_image_paths参照。直前/直後の実在画像で既に補完されているため、
+            # 通常はこのimg_pathがNoneになることはない)
+            img_path = self.resolved_img_paths[sym][idx]
             try:
+                if img_path is None:
+                    raise FileNotFoundError("この銘柄には有効な画像が1件も存在しません")
                 img = Image.open(img_path).convert("RGB")
                 img_tensor = self.transform(img)
             except Exception as e:
-                # 💡 修正: 黒画像(ゼロテンソル)へのフォールバック自体は維持する(エラーで
-                # 処理全体を止めないため)が、無言のまま進むと precompute_portfolio.py の
-                # 出力に気づかれない汚染を生む(2026-10-23の検証で判明)。最低限ログに残す。
-                # 本来の防御線は precompute_portfolio.py 側の事前完全性チェック
-                # (check_images_complete)であり、ここに到達すること自体が想定外。
+                # 💡 ここに到達するのは、銘柄に実在する画像が1件も無い(極端な異常事態)
+                # か、解決済みのはずのパスへの読み込みがDrive側の一時的な問題等で
+            # 失敗した場合のみ。本来の欠損補完は_resolve_image_pathsの前方/後方
+            # 補完で既に完了しているため、ここは最後の防御線として黒画像にする。
                 logging.warning(f"⚠️ 画像の読み込みに失敗したため黒画像で代替します: {img_path} ({e})")
                 img_tensor = torch.zeros((3, 224, 224), dtype=torch.float32)
             
