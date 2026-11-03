@@ -30,9 +30,16 @@ def _with_drive_retry(func, *args, **kwargs):
     raise last_err
 
 
-def _list_dir_entries(path):
-    with os.scandir(path) as it:
-        return {entry.name: entry for entry in it}
+def _list_dir_names(path):
+    """
+    💡 修正(2026-11-03の調査で判明した問題への対応): 以前は本関数がos.scandir()で
+    DirEntryを返し、呼び出し元が各ファイルごとにentry.stat()を呼んでサイズ(>0)まで
+    検証していた。しかしmediumモードの全期間では90,000件超×7銘柄規模のstat呼び出しが
+    発生し、precompute_portfolio.py側でこのチェック自体がGoogle Drive側のレート制限を
+    悪化させ、直後の推論ループまで連鎖的に遅くなる事例が発生した。本診断ツールも同じ
+    負荷をDriveにかけていたため、同様にファイル名の一覧取得(os.listdir)のみに留める。
+    """
+    return set(os.listdir(path))
 
 
 def group_contiguous(sorted_indices):
@@ -100,7 +107,7 @@ def check_raw_source_existence(symbol, mode, phase, missing_time_strs):
 
 
 def main():
-    logging.info("diagnose_missing_images.py ver1.1")
+    logging.info("diagnose_missing_images.py ver1.2")
     parser = argparse.ArgumentParser(
         description="画像欠損の詳細診断(precompute_portfolio.pyのcheck_images_completeと"
                     "同じ判定基準で、全件の分布・他銘柄との相関・元データの存在有無を出力する"
@@ -132,19 +139,12 @@ def main():
     for sym in symbols:
         folder = os.path.join(img_dir, sym, f"{args.mode}_MTF")
         logging.info(f"[{sym}] フォルダを列挙中: {folder}")
-        entries = _with_drive_retry(_list_dir_entries, folder)
+        existing_names = _with_drive_retry(_list_dir_names, folder)
 
         missing_idx = []
         for i, t in enumerate(time_strs):
             filename = f"{t}.png"
-            entry = entries.get(filename)
-            is_present = False
-            if entry is not None:
-                try:
-                    is_present = entry.stat().st_size > 0
-                except OSError:
-                    is_present = False
-            if not is_present:
+            if filename not in existing_names:
                 missing_idx.append(i)
 
         missing_idx_by_symbol[sym] = missing_idx

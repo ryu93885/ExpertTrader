@@ -41,14 +41,25 @@ def _with_drive_retry(func, *args, **kwargs):
     raise last_err
 
 
-def _list_dir_entries(path):
-    with os.scandir(path) as it:
-        return {entry.name: entry for entry in it}
+def _list_dir_names(path):
+    """
+    💡 修正(2026-11-03の調査で判明した問題への対応): 以前は本関数がos.scandir()で
+    DirEntryを返し、呼び出し元が各ファイルごとにentry.stat()を呼んでサイズ(>0)まで
+    検証していた。しかしmediumモードの全期間では90,763ステップ×7銘柄=約64万回の
+    stat呼び出しが発生し、このチェック自体(約37分)がGoogle Drive側のレート制限を
+    悪化させ、直後に始まる本体の推論ループ(同じDriveマウント上で約64万回の画像読み込みを
+    行う)まで連鎖的に遅くなる事例が発生した(「数時間」で終わっていた処理が「60時間」に
+    悪化)。ファイル名の一覧取得(os.listdir、ディレクトリ1回の読み取りのみ)だけに留め、
+    個々のファイルへのサイズ確認は行わない。ゼロバイト等の破損ファイルの検出は失うが、
+    実際に読み込む際(__getitem__のImage.open)で例外として捕捉され黒画像にフォールバック
+    するため、安全性は維持される。
+    """
+    return set(os.listdir(path))
 
 
 class PortfolioFXDataset(Dataset):
     def __init__(self,merged_csv_path,base_img_dir,symbols,mode = "short",seq_length = 40):
-        logging.info("portfolio_dataset.py ver211.0")
+        logging.info("portfolio_dataset.py ver212.0")
         self.df = _with_drive_retry(pd.read_csv, merged_csv_path)
         self.base_img_dir = base_img_dir
         self.symbols = symbols
@@ -108,10 +119,10 @@ class PortfolioFXDataset(Dataset):
         for sym in self.symbols:
             folder = os.path.join(self.base_img_dir, sym, f"{self.mode}_MTF")
             try:
-                entries = _with_drive_retry(_list_dir_entries, folder)
+                existing_names = _with_drive_retry(_list_dir_names, folder)
             except OSError as e:
                 logging.error(f"❌ 画像フォルダにアクセスできません: {folder} ({e})")
-                entries = {}
+                existing_names = set()
 
             paths = [None] * len(time_strs)
             was_real = [False] * len(time_strs)
@@ -119,14 +130,7 @@ class PortfolioFXDataset(Dataset):
 
             for i, time_str in enumerate(time_strs):
                 filename = f"{time_str}.png"
-                entry = entries.get(filename)
-                is_present = False
-                if entry is not None:
-                    try:
-                        is_present = entry.stat().st_size > 0
-                    except OSError:
-                        is_present = False
-                if is_present:
+                if filename in existing_names:
                     paths[i] = os.path.join(folder, filename)
                     was_real[i] = True
                 else:
