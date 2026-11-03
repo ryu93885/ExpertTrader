@@ -41,6 +41,27 @@ def _with_drive_retry(func, *args, **kwargs):
     raise last_err
 
 
+# 💡 追加(2026-11-03の調査で判明した問題への対応): num_workersを増やして並列読み込みを
+# 強化する(別のコマット参照)ことで、Drive側の一時的な輿輍によるエラーが増える可能性が
+# あるため、画像読み込み自体にも軽いリトリイを追加する。_with_drive_retryよりリトリイ
+# 間隔を短くしている(行ごとに発生するため、1回の失敗で長く待つと全体が大きく遅くなる)。
+IMAGE_READ_MAX_RETRIES = 2
+IMAGE_READ_RETRY_BACKOFF_BASE = 2  # 秒
+
+
+def _open_image_with_retry(img_path):
+    last_err = None
+    for attempt in range(IMAGE_READ_MAX_RETRIES):
+        try:
+            return Image.open(img_path).convert("RGB")
+        except OSError as e:
+            if e.errno not in (errno.ENOTCONN, errno.EIO):
+                raise
+            last_err = e
+            time.sleep(IMAGE_READ_RETRY_BACKOFF_BASE * (2 ** attempt))
+    raise last_err
+
+
 def _list_dir_names(path):
     """
     💡 修正(2026-11-03の調査で判明した問題への対応): 以前は本関数がos.scandir()で
@@ -59,7 +80,7 @@ def _list_dir_names(path):
 
 class PortfolioFXDataset(Dataset):
     def __init__(self,merged_csv_path,base_img_dir,symbols,mode = "short",seq_length = 40):
-        logging.info("portfolio_dataset.py ver212.0")
+        logging.info("portfolio_dataset.py ver213.0")
         self.df = _with_drive_retry(pd.read_csv, merged_csv_path)
         self.base_img_dir = base_img_dir
         self.symbols = symbols
@@ -182,7 +203,7 @@ class PortfolioFXDataset(Dataset):
             try:
                 if img_path is None:
                     raise FileNotFoundError("この銘柄には有効な画像が1件も存在しません")
-                img = Image.open(img_path).convert("RGB")
+                img = _open_image_with_retry(img_path)
                 img_tensor = self.transform(img)
             except Exception as e:
                 # 💡 ここに到達するのは、銘柄に実在する画像が1件も無い(極端な異常事態)

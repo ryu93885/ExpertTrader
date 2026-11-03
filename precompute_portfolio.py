@@ -2,8 +2,9 @@ import argparse
 import sys
 import errno
 import time
+import pickle
 import torch
-from torch.utils.data import DataLoader,dataloader
+from torch.utils.data import DataLoader,dataloader,Subset
 import pandas as pd
 import numpy as np
 import os
@@ -25,6 +26,17 @@ DRIVE_PORTFOLIO_DATA_DIR = "/content/drive/MyDrive/FX_AI_Models/portfolio_data"
 # 一時的な切断はリトリイで吸収する。
 DRIVE_IO_MAX_RETRIES = 5
 DRIVE_IO_RETRY_BACKOFF_BASE = 10  # 秒。リトリイ毎に倍増
+
+# 💡 追加(2026-11-03の調査で判明した問題への対応): 以前はzip展開でColabローカル
+# ディスクに置いていた画像を、現在はGoogle Drive上に直接展開した構造から読んでおり、
+# 個別ファイル読み込みのレイテンシがそのまま積み重なって本体の推論ループが
+# 大幅に遅くなっている(実測: 約0.37秒/枚 × 約64万枚 ≒ 65時間、観測されたETAと一致)。
+# この速度自体はnum_workersの増加(main()側)で対処するが、それでも長時間(数時間〜)
+# かかることに変わりはないため、途中経過を定期的に保存し、ランタイム切断等で中断しても
+# 最初からやり直しにならないようにする。
+CHECKPOINT_DIR = "precompute_checkpoints"
+DRIVE_CHECKPOINT_DIR = "/content/drive/MyDrive/FX_AI_Models/precompute_checkpoints"
+CHECKPOINT_EVERY_N_BATCHES = 20
 
 
 def backup_to_drive(local_path):
@@ -139,8 +151,85 @@ def check_images_complete(dataset, symbols, max_missing_pct, allow_missing_image
     return False
 
 
+def _checkpoint_path(phase, mode):
+    return os.path.join(CHECKPOINT_DIR, f"precompute_checkpoint_{phase}_{mode}.pkl")
+
+
+def _drive_checkpoint_path(phase, mode):
+    return os.path.join(DRIVE_CHECKPOINT_DIR, f"precompute_checkpoint_{phase}_{mode}.pkl")
+
+
+def save_checkpoint(phase, mode, all_probs, all_risks, rows_done, total_rows):
+    """
+    💡 追加(2026-11-03の調査で判明した問題への対応): 行ごとの推論結果(途中経過)を
+    ローカルとGoogle Drive(両方)に保存する。推論ループが長時間(数時間〜)かかる状況で、
+    ランタイム切断等により中断してもここまでの計算を失わないようにするため。
+    """
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    path = _checkpoint_path(phase, mode)
+    data = {
+        "all_probs": all_probs,
+        "all_risks": all_risks,
+        "rows_done": rows_done,
+        "total_rows": total_rows,
+    }
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+    if os.path.exists("/content/drive/MyDrive"):
+        try:
+            os.makedirs(DRIVE_CHECKPOINT_DIR, exist_ok=True)
+            shutil.copy2(path, _drive_checkpoint_path(phase, mode))
+        except Exception as e:
+            logging.warning(f"⚠️ チェックポイントのGoogle Driveへのバックアップに失敗しました: {e}")
+
+
+def load_checkpoint(phase, mode, total_rows):
+    """
+    💡 追加(2026-11-03の調査で判明した問題への対応): 保存済みのチェックポイントがあれば
+    読み込み、そこから再開できるようにする。ローカルに無い場合はGoogle Driveからの
+    復元も試みる(ランタイム再起動でローカルディスクが失われた場合に対応)。
+    dataset側の行数が保存時と一致しない場合(merged_csvの内容が変わった等)は、
+    不整合な再開を避けるため使用しない。
+    """
+    path = _checkpoint_path(phase, mode)
+    if not os.path.exists(path):
+        d_path = _drive_checkpoint_path(phase, mode)
+        if os.path.exists(d_path):
+            os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+            shutil.copy2(d_path, path)
+            logging.info(f"☁️ Google Driveからチェックポイントを復元しました: {d_path}")
+
+    if not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+    except Exception as e:
+        logging.warning(f"⚠️ チェックポイントの読み込みに失敗しました。最初から開始します: {e}")
+        return None
+
+    if data.get("total_rows") != total_rows:
+        logging.warning(
+            "⚠️ チェックポイントの行数が現在のデータと一致しないため、使用せず最初から"
+            f"開始します(チェックポイント: {data.get('total_rows')}行, 現在: {total_rows}行)。"
+        )
+        return None
+
+    return data
+
+
+def _delete_checkpoint(phase, mode):
+    for p in (_checkpoint_path(phase, mode), _drive_checkpoint_path(phase, mode)):
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception as e:
+                logging.warning(f"⚠️ チェックポイントの削除に失敗しました ({p}): {e}")
+
+
 def main():
-    logging.info("precompute_portfolio.py ver213.0")
+    logging.info("precompute_portfolio.py ver214.0")
     # 💡 修正: 以前は "train" フェーズ専用に固定されており、test_portfolio.py が
     # 必要とする "portfolio_merged_data_test_with_preds.csv" を作る手段が存在しなかった。
     # (merge_portfolio_data.py は train/test 両方を出力するのに、precompute側が
@@ -155,6 +244,12 @@ def main():
                          help="銘柄ごとの画像欠損率がこの値(%%)未満であれば、自動的に直前/直後の"
                               "実在画像で解決して続行する(デフォルト0.1%%。銘柄間の取引カレンダーの"
                               "違い等による、ごく少数の避けられない欠損を許容するための閾値)")
+    # 💡 追加(2026-11-03の調査で判明した問題への対応): Google Drive上の個別ファイル
+    # 読み込みはレイテンシが支配的で、num_workers=2では待ち時間が直列に積み重なり
+    # 極端に遅くなっていた(実測: 約65時間)。I/Oバウンドな処理のため、CPUコア数より
+    # 多いワーカー数を指定しても問題なく、並列化によって総時間を大きく短縮できる。
+    parser.add_argument("--num-workers", type=int, default=16,
+                         help="画像読み込みに使うDataLoaderのワーカー数(デフォルト16)")
     args = parser.parse_args()
 
     symbols = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
@@ -163,6 +258,23 @@ def main():
     img_dir = "images"
     model_path = f"saved_model/final_best_model_{mode}.pth"
     output_csv = f"portfolio_merged_data_{args.phase}_with_preds.csv"
+
+    # 💡 追加(2026-11-03の調査で判明した問題への対応): 指定された(phase, mode)の
+    # 事前推論が既に完了している(ローカルまたはGoogle Driveのバックアップ先に完成済みの
+    # 出力ファイルが存在する)場合は、計算全体をスキップする。run_colab_pipeline.py側にも
+    # 同様のチェック(data_already_prepared)があるが、precompute_portfolio.pyを単体で
+    # 実行する場合にも効くよう、ここにも実装する。
+    drive_output_path = os.path.join(DRIVE_PORTFOLIO_DATA_DIR, os.path.basename(output_csv))
+    if os.path.exists(output_csv) and os.path.getsize(output_csv) > 0:
+        logging.info(f"✅ {output_csv} は既に存在するため、事前推論をスキップします。")
+        return
+    if os.path.exists(drive_output_path) and os.path.getsize(drive_output_path) > 0:
+        logging.info(
+            f"☁️ Google Driveに完成済みの{os.path.basename(output_csv)}が見つかったため、"
+            f"復元してスキップします: {drive_output_path}"
+        )
+        shutil.copy2(drive_output_path, output_csv)
+        return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"デバイス:{device}")
@@ -181,47 +293,74 @@ def main():
         # sys.exit(1)で明示的に異常終了を伝える。
         sys.exit(1)
 
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=2, collate_fn=collate_fn_drop_none)
-
     #2.loading model
     input_dim = len(dataset.feature_cols[symbols[0]])
     model = MultimodalFXmodel(num_tabular_features=input_dim).to(device)
     # 💡 修正(2026-10-30): モデル重みもDrive上のファイルであり、同じErrno 107/5の
     # リスクがあるため、_with_drive_retryで読み込む。
-    checkpoint = _with_drive_retry(torch.load, model_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    checkpoint_model = _with_drive_retry(torch.load, model_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint_model["model_state_dict"])
     model.eval()
 
     #3.listing result of prediction
-    all_probs = {sym:[] for sym in symbols}
-    all_risks = {sym:[] for sym in symbols}
+    # 💡 修正(2026-11-03の調査で判明した問題への対応): チェックポイントがあれば
+    # そこから再開する(詳細はload_checkpoint参照)。
+    total_rows = len(dataset)
+    resumed = load_checkpoint(args.phase, mode, total_rows)
+    if resumed is not None:
+        all_probs = resumed["all_probs"]
+        all_risks = resumed["all_risks"]
+        rows_done = resumed["rows_done"]
+        logging.info(f"🔄 チェックポイントを検出しました。{rows_done}/{total_rows}行目から再開します。")
+    else:
+        all_probs = {sym:[] for sym in symbols}
+        all_risks = {sym:[] for sym in symbols}
+        for _ in range(dataset.seq_length - 1):
+            for sym in symbols:
+                all_probs[sym].append([0.0,0.0,0.0])
+                all_risks[sym].append(0.0)
+        rows_done = dataset.seq_length - 1
 
-    logging.info("全データの事前推論を開始(バッチ処理)")
+    logging.info(f"全データの事前推論を開始(バッチ処理、{rows_done}/{total_rows}行目から)")
 
-    for _ in range(dataset.seq_length - 1):
-        for sym in symbols:
-            all_probs[sym].append([0.0,0.0,0.0])
-            all_risks[sym].append(0.0)
+    if rows_done < total_rows:
+        # 💡 修正(2026-11-03): 残り行のみを対象とするSubsetを作ることで、既に完了した
+        # 行の画像読み込み(最も時間のかかる処理)を再実行しない。num_workersも
+        # args.num_workersに変更(詳細はCLI引数のヘルプ参照)。
+        remaining_dataset = Subset(dataset, range(rows_done, total_rows))
+        dataloader = DataLoader(
+            remaining_dataset, batch_size=64, shuffle=False,
+            num_workers=args.num_workers, collate_fn=collate_fn_drop_none,
+        )
 
+        with torch.no_grad():
+            for batch_i, batch in enumerate(tqdm(dataloader, desc="Pre-computing")):
+                if batch is None:
+                    continue
+                imgs_batch,tabs_batch = batch
+                batch_rows = imgs_batch.shape[0]
 
-    with torch.no_grad():
-        for batch in tqdm(dataloader,desc = "Pre-computing"):
-            if batch is None:continue
-            imgs_batch,tabs_batch = batch
+                for i,sym in enumerate(symbols):
+                    sym_imgs = imgs_batch[:,i,:,:,:].to(device)
+                    sym_tabs = tabs_batch[:,i,:,:].to(device)
+                    # 💡 B案: 銘柄埋め込み用のID。バッチ内の全サンプルがこの銘柄なので、
+                    # 同じIDをバッチサイズ分並べる(学習側dataset.pyと同じSYMBOL_TO_IDを使用)。
+                    sym_ids = torch.full((sym_imgs.shape[0],), SYMBOL_TO_ID[sym], dtype=torch.long, device=device)
 
-            for i,sym in enumerate(symbols):
-                sym_imgs = imgs_batch[:,i,:,:,:].to(device)
-                sym_tabs = tabs_batch[:,i,:,:].to(device)
-                # 💡 B案: 銘柄埋め込み用のID。バッチ内の全サンプルがこの銘柄なので、
-                # 同じIDをバッチサイズ分並べる(学習側dataset.pyと同じSYMBOL_TO_IDを使用)。
-                sym_ids = torch.full((sym_imgs.shape[0],), SYMBOL_TO_ID[sym], dtype=torch.long, device=device)
+                    class_out,risk_out = model(sym_imgs,sym_tabs,sym_ids)
+                    probs = torch.softmax(class_out,dim = 1).cpu().numpy()
+                    risks = risk_out.cpu().numpy()
 
-                class_out,risk_out = model(sym_imgs,sym_tabs,sym_ids)
-                probs = torch.softmax(class_out,dim = 1).cpu().numpy()
-                risks = risk_out.cpu().numpy()
+                    all_probs[sym].extend(probs.tolist())
+                    all_risks[sym].extend(risks.flatten().tolist())
 
-                all_probs[sym].extend(probs.tolist())
-                all_risks[sym].extend(risks.flatten().tolist())
+                rows_done += batch_rows
+
+                if (batch_i + 1) % CHECKPOINT_EVERY_N_BATCHES == 0:
+                    save_checkpoint(args.phase, mode, all_probs, all_risks, rows_done, total_rows)
+                    logging.info(f"💾 チェックポイント保存: {rows_done}/{total_rows}行")
+
+        save_checkpoint(args.phase, mode, all_probs, all_risks, rows_done, total_rows)
 
     #4.saving CSV
     # 💡 修正(2026-10-30): mergeされたCSVの再読み込み・結果の書き出しも同じDrive上の
@@ -235,6 +374,10 @@ def main():
     _with_drive_retry(df.to_csv, output_csv, index=False)
     logging.info(f"✨ 事前推論完了！ {output_csv} に保存しました。")
     backup_to_drive(output_csv)
+
+    # 💡 追加(2026-11-03): 完了したのでチェックポイントは不要。残しておくと、次回
+    # merged_csvが変わらないまま誤って古い途中経過から再開してしまうリスキがあるため削除する。
+    _delete_checkpoint(args.phase, mode)
 
 if __name__ == "__main__":
     main()
