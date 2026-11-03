@@ -183,9 +183,9 @@ def main():
         # バックテストできる状態にならない(portfolio_merged_data_test_with_preds.csv が
         # 生成されないため)。
         print("\n推論結果をcsvファイルに結合して保存します (train)")
-        run_command(f"python precompute_portfolio.py --phase train --mode {MODE}")
+        run_command(f"python precompute_portfolio.py --phase train --mode {MODE} --allow-missing-images")
         print("\n推論結果をcsvファイルに結合して保存します (test)")
-        run_command(f"python precompute_portfolio.py --phase test --mode {MODE}")
+        run_command(f"python precompute_portfolio.py --phase test --mode {MODE} --allow-missing-images")
 
     # 💡 追加: データ処理をスキップした場合、チャート画像の有無までは確認していない
     # (画像生成はこのパイプラインの対象外で、generate_images.py を別途実行する運用のため)。
