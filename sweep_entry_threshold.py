@@ -1,23 +1,27 @@
 """
-動的エントリー閾値(entry_threshold_window / entry_threshold_percentile)の
-パラメータ探索スクリプト。
+動的エントリー閾値(entry_threshold_window / entry_threshold_percentile)と
+同時保有上限(max_concurrent_positions)のパラメータ探稢スクリプト。
 
 目的:
     portfolio_trading_bot.py / portfolio_env.py の固定エントリー閾値(0.2)を、
     銘柄ごとの直近の行動分布に基づく動的閾値に置き換える変更を検証するため、
-    学習済みモデル(再学習なし)をそのまま使い、複数の(window, percentile)の
-    組み合わせでバックテストを繰り返し、月利換算・最大ドローダウン・勝率・
-    プロフィットファクター・トレード数を比較する。
+    学習済みモデル(再学習なし)をそのまま使い、複数の(window, percentile,
+    max_concurrent_positions)の組み合わせでバッデーベドを繰り返し、月利換算・
+    最大ドローダウン・勝率・プロフィットファクター・トレード数を比較する。
+
+    💡 追加(2026-11-04の検証結果を受けて): 最初のwindow×percentileのみの探稢では、
+    月利目標(デフォルト5%)に対し最良でも1.1%程度にとどまる一方、最大DDは
+    許容値(20%)に対し1.7〜6.4%程度しか使っていず、リスク予算に大きな余力が
+    あることが判明した。max_concurrent_positionsも複数値で振ることで、この
+    余力を使ってより高いリターンを狙えるかを検証できるようにした。
 
 重要:
     モデルの再学習は一切行わない(model.predict()による推論のみ)。
-    同時保有上限(max_concurrent_positions)はデフォルトで4に固定している
-    (急な値動きに対する同時エクスポージャーを抑える安全策)。この値自体を
-    変えて試したい場合は --max-concurrent-positions で指定できる。
 
 使い方:
     python sweep_entry_threshold.py --mode medium
-    python sweep_entry_threshold.py --mode medium --windows 100,200,300,500 --percentiles 40,50,60,70,80
+    python sweep_entry_threshold.py --mode medium --windows 100,200,300,500 \\
+        --percentiles 40,50,60,70,80 --max-concurrent-positions 3,4,5,6,7
 """
 
 import os
@@ -89,17 +93,21 @@ def run_one_combo(dataset, symbols, vec_norm_path, model, window, percentile, ma
 
 def main():
     setup_logger()
-    logging.info("sweep_entry_threshold.py ver1.0")
+    logging.info("sweep_entry_threshold.py ver2.0")
 
-    parser = argparse.ArgumentParser(description="動的エントリー閾値のパラメータ探索(再学習なし)")
+    parser = argparse.ArgumentParser(description="動的エントリー閾値・同時保有上限のパラメータ探稢(再学習なし)")
     parser.add_argument("--symbols", default=["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"])
     parser.add_argument("--mode", default="medium", choices=["short", "medium", "long"])
     parser.add_argument("--windows", type=str, default="100,200,300,500",
-                         help="ローリングウィンドウのサンプル数(銘柄ごと)。カンマ区切りで複数指定")
+                         help="ローリングウィンドウのサンプル数(銘柄ごと)。カンフ離で複数指定")
     parser.add_argument("--percentiles", type=str, default="40,50,60,70,80",
-                         help="動的閾値に使うパーセンタイル。カンマ区切りで複数指定")
-    parser.add_argument("--max-concurrent-positions", type=int, default=4,
-                         help="同時保有できる最大銘柄数(安全策)。全組み合わせに共通で適用")
+                         help="動的閾値に使うパーセンタイル。カンフ離で複数指定")
+    # 💡 修正(2026-11-04): 単一値から、windows/percentilesと同じ形式のカンフ離切り
+    # 複数値に変更。最初の探稢で最大DDに大きな余力(目標20%に対し実縼1.7〜6.4%)が
+    # 判明したため、この余力を使ってより高いリターンを狙えるかを検証する。
+    parser.add_argument("--max-concurrent-positions", type=str, default="3,4,5,6,7",
+                         help="同時保有できる最大銘柄数(安全策)。カンフ離で複数指定可"
+                              "(symbols数が7なので7が実質的な上限=キャップなしと同義)")
     parser.add_argument("--target-monthly-return", type=float, default=5.0)
     parser.add_argument("--target-max-drawdown", type=float, default=20.0)
     parser.add_argument("--min-trades", type=int, default=10,
@@ -108,6 +116,7 @@ def main():
 
     windows = [int(w) for w in args.windows.split(",") if w.strip()]
     percentiles = [float(p) for p in args.percentiles.split(",") if p.strip()]
+    max_concurrent_list = [int(m) for m in args.max_concurrent_positions.split(",") if m.strip()]
 
     test_csv = "portfolio_merged_data_test_with_preds.csv"
     img_dir = "images"
@@ -125,7 +134,7 @@ def main():
     logging.info("テスト用データセットを読み込んでいます....")
     dataset = PortfolioFXDataset(merged_csv_path=test_csv, base_img_dir=img_dir, symbols=args.symbols, mode=args.mode)
     model = SAC.load(rl_model_path, device=device)
-    logging.info("✅ モデル・データセットの読み込み完了。探索を開始します。")
+    logging.info("✅ モデル・データセットの読み込み完了。探稢を開始します。")
 
     results = []
 
@@ -138,12 +147,17 @@ def main():
         f"monthly_return={baseline['monthly_return_pct']} max_dd={baseline['max_drawdown_pct']:.2f}%"
     )
 
-    combos = list(itertools.product(windows, percentiles))
-    for idx, (window, percentile) in enumerate(combos, start=1):
-        logging.info(f"--- [{idx}/{len(combos)}] window={window} percentile={percentile} を実行中 ---")
+    # 💡 修正(2026-11-04): window×percentileの2軸に加え、max_concurrent_positionsも
+    # 軸に加えた3軸の総当たり探稢に変更。
+    combos = list(itertools.product(windows, percentiles, max_concurrent_list))
+    for idx, (window, percentile, max_concurrent) in enumerate(combos, start=1):
+        logging.info(
+            f"--- [{idx}/{len(combos)}] window={window} percentile={percentile} "
+            f"max_concurrent={max_concurrent} を実行中 ---"
+        )
         summary = run_one_combo(
             dataset, args.symbols, vec_norm_path, model,
-            window=window, percentile=percentile, max_concurrent=args.max_concurrent_positions,
+            window=window, percentile=percentile, max_concurrent=max_concurrent,
         )
         results.append(summary)
         monthly = summary["monthly_return_pct"]
@@ -170,7 +184,7 @@ def main():
             writer.writerow({k: r.get(k) for k in fieldnames})
     logging.info(f"📄 全組み合わせの比較結果を保存しました: {csv_path}")
 
-    # 💡 目標(月刉5%・最大DD20%)を満たす組み合わせの中から、月利が最も高いものを推奨する。
+    # 💡 目標(月券ca5%・最大DD20%)を満たす組み合わせの中から、月利が最も高いものを推奨する。
     # サンプル数が少なすぎる(--min-trades未満)組み合わせは、偶然の結果を避けるため除外する。
     candidates = [
         r for r in results
@@ -180,7 +194,7 @@ def main():
         and r["total_trades"] >= args.min_trades
     ]
     logging.info("=" * 70)
-    logging.info("🏁 探索完了")
+    logging.info("🏁 探稢完了")
     logging.info("=" * 70)
     logging.info(
         f"baseline(現行): trades={baseline['total_trades']} "
@@ -189,7 +203,8 @@ def main():
     if not candidates:
         logging.warning(
             f"⚠️ 目標(最大DD{args.target_max_drawdown}%以下・トレード数{args.min_trades}件以上)を"
-            f"満たす組み合わせが見つかりませんでした。windows/percentilesの範囲を広げて再実行してください。"
+            f"満たす組み合わせが見つかりませんでした。windows/percentiles/max-concurrent-positionsの"
+            f"範囲を広げて再実行してください。"
         )
     else:
         best = max(candidates, key=lambda r: r["monthly_return_pct"])
@@ -206,8 +221,9 @@ def main():
         )
         if best["monthly_return_pct"] < args.target_monthly_return:
             logging.warning(
-                "⚠️ この候補でも月利目標には届いていません。windows/percentilesの範囲を広げる、"
-                "または別の改善案(非RLモデルの併用等)の検討をおすすめします。"
+                "⚠️ この候補でも月利目標には届いていません。windows/percentiles/"
+                "max-concurrent-positionsの範囲を広げる、または別の改善案"
+                "(非RLモデルの併用等)の検討をおすすめします。"
             )
     logging.info("=" * 70)
 
