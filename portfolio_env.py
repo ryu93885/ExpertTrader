@@ -15,12 +15,21 @@ COUNTERFACTUAL_PENALTY_COEF = 1.0
 
 # 💡 追加: 新規エントリー判定の閾値(abs(act_direction)と比較する値)。
 # entry_threshold_window を指定しない場合(デフォルト)は、常にこの固定値のみを使う
-# (従来通りの挙動と完全に同一)。entry_threshold_windowを指定すると、銘柄ごとの
+# (従来通りの振る舞いと完全に同一)。entry_threshold_windowを指定すると、銘柄ごとの
 # 直近の行動分布から動的に閾値を計算するようになり、この固定値はサンプルが
 # 十分に溢まるまでのフォールバック、および動的閾値の下限(ENTRY_THRESHOLD_FLOOR)として
 # のみ使われる。
 ENTRY_THRESHOLD_FALLBACK = 0.2
 ENTRY_THRESHOLD_FLOOR = 0.05
+
+# 💡 追加(2026-11-05の検証で判明した問題への対応): 1トレードあたりのリスク率
+# (口座残高に対する割合)。これまでstep()内に0.02としてハードコードされていた
+# ポジションサイズの実体。sweep_entry_threshold.pyでの探稢の結果、
+# max_concurrent_positionsを増やしても最大DDの使用率が20%の許容値に対して
+# 2〜3%台にしか達しておらず、リスク予算に大きな余力があることが判明したため、
+# この値もパラメータ化し、どこまで上げると信頼性(DD等)が問題になるかを
+# 検証できるようにする。
+RISK_PER_TRADE_PCT_DEFAULT = 0.02
 
 
 class PortfolioFXEnv(gym.Env):
@@ -30,10 +39,10 @@ class PortfolioFXEnv(gym.Env):
     """
     def __init__(self, dataset,symbols, initial_balance=10000000,fixed_start = False,
                  entry_threshold_window=None, entry_threshold_percentile=70,
-                 max_concurrent_positions=None):
+                 max_concurrent_positions=None, risk_per_trade_pct=RISK_PER_TRADE_PCT_DEFAULT):
         super(PortfolioFXEnv, self).__init__()
         logging.info("PortfolioFXEnv: 21-Action Multi-Asset Initialization")
-        logging.info("portfolio_env.py ver210.0")
+        logging.info("portfolio_env.py ver211.0")
 
         self.dataset = dataset
 
@@ -47,14 +56,18 @@ class PortfolioFXEnv(gym.Env):
         # 💡 追加: 動的エントリー閾値のローリングウィンドウ(銘柄ごとのサンプル数)。
         # Noneなら動的閾値は無効化され、常にENTRY_THRESHOLD_FALLBACKを使う
         # (train_portfolio_rl.py / test_portfolio.py の既存の呼び出しは引数を渡さないため、
-        # 従来の挙動と完全に同一のまま変わらない)。
+        # 従来の振る舞いと完全に同一のまま変わらない)。
         self.entry_threshold_window = entry_threshold_window
         self.entry_threshold_percentile = entry_threshold_percentile
         # 💡 追加: 同時に保有できる最大銘柄数(ポートフォリオ全体)。Noneなら無制限
         # (従来通り)。間口を広げる(動的閾値で取引頻度を増やす)ほど、相関の強い
-        # 複数銘柄が同時にシグナルを出した際の急変動への同時エクスポージャーが
-        # 増えるため、そのリスクを抑えるための安全策。
+        # 複数銘柄が同時にシグナルを出した際の急変動への同時エキスポージャーが
+        # 増えるため、そのリスクを押えるための安全策。
         self.max_concurrent_positions = max_concurrent_positions
+        # 💡 追加(2026-11-05): 1トレードあたりのリスク率(詳細はRISK_PER_TRADE_PCT_DEFAULT
+        # のコメント参照)。train_portfolio_rl.py / test_portfolio.py の既存の呼び出しは
+        # 引数を渡さないため、従来通りデフォルト(2%)のまま変わらない。
+        self.risk_per_trade_pct = risk_per_trade_pct
         # 銘柄ごとの設定値（コントラクトサイズやポイントバリュー）
         # 💡 修正: 旧ロジックは "USDJPY" or "EUR" を含むかどうかだけで判定しており、
         # GBPUSD/AUDUSD/GBPJPY が誤ってGOLDと同じ扱い(contract_size=100)になっていた。
@@ -68,7 +81,7 @@ class PortfolioFXEnv(gym.Env):
 
         self.symbol_configs = {sym: _get_symbol_config(sym) for sym in self.symbols}
 
-        # アクション空間: 3アクション(方向, TP, SL) × 7銘柄 = 21次元
+        # アドィオン空間: 3アドィオン(方向, TP, SL) × 7銘柄 = 21次元
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_symbols * 3,), dtype=np.float32)
         
         # 観察空間の次元計算（適宜調整）:
@@ -207,7 +220,7 @@ class PortfolioFXEnv(gym.Env):
         row = self.dataset.df.iloc[self.current_step]
         base_tf = "M5" if self.dataset.mode == "short" else "M15" if self.dataset.mode == "medium" else "H4"
         tf = "M15" if self.dataset.mode == "short" else "H4" if self.dataset.mode == "medium" else "D1"
-        # 💡 修正: "_raw" が抖けており、標準化済み(Zスコア)の値を実勢レートとして
+        # 💡 修正: "_raw" が抑けており、標準化済み（Zスコア）の値を実勢レートとして
         # 使ってしまっていた(_get_observation()側は元々 "_raw" 付きで正しい)。
         usdjpy_col = f"USDJPY_{base_tf}_close_raw"
         if usdjpy_col in row.index:
@@ -296,7 +309,8 @@ class PortfolioFXEnv(gym.Env):
             )
             if self.positions[sym] == 0 and can_open_new and abs(act_direction) > threshold:
                 direction_sign = 1.0 if act_direction > 0 else -1.0
-                risk_amount = max(self.equity, 0) * 0.02 * abs(act_direction)
+                # 💡 修正(2026-11-05): ハードコードされていた0.02を self.risk_per_trade_pct に変更。
+                risk_amount = max(self.equity, 0) * self.risk_per_trade_pct * abs(act_direction)
                 
                 sl_multiplier = 1.0 + (act_sl + 1.0)
                 sl_dist = atr * sl_multiplier
