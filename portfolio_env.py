@@ -39,10 +39,11 @@ class PortfolioFXEnv(gym.Env):
     """
     def __init__(self, dataset,symbols, initial_balance=10000000,fixed_start = False,
                  entry_threshold_window=None, entry_threshold_percentile=70,
-                 max_concurrent_positions=None, risk_per_trade_pct=RISK_PER_TRADE_PCT_DEFAULT):
+                 max_concurrent_positions=None, risk_per_trade_pct=RISK_PER_TRADE_PCT_DEFAULT,
+                 episode_start_idx=None, episode_end_idx=None):
         super(PortfolioFXEnv, self).__init__()
         logging.info("PortfolioFXEnv: 21-Action Multi-Asset Initialization")
-        logging.info("portfolio_env.py ver211.0")
+        logging.info("portfolio_env.py ver212.0")
 
         self.dataset = dataset
 
@@ -68,6 +69,13 @@ class PortfolioFXEnv(gym.Env):
         # のコメント参照)。train_portfolio_rl.py / test_portfolio.py の既存の呼び出しは
         # 引数を渡さないため、従来通りデフォルト(2%)のまま変わらない。
         self.risk_per_trade_pct = risk_per_trade_pct
+        # 💡 追加(2026-11-06): 再現性確認(テスト期間を複数の部分期間に分割して個別に
+        # 検証する)用に、1エピソードの範囲をdataset全体の一部に限定できるようにする。
+        # 両方Noneなら従来通dataset全体(先頭〜末尾)を1エピソードとして扱う
+        # (train_portfolio_rl.py / test_portfolio.py の既存の呼び出しは引数を渡さないため、
+        # 従来の振る舞いと完全に同一のまま変わらない)。
+        self.episode_start_idx = episode_start_idx
+        self.episode_end_idx = episode_end_idx
         # 銘柄ごとの設定値（コントラクトサイズやポイントバリュー）
         # 💡 修正: 旧ロジックは "USDJPY" or "EUR" を含むかどうかだけで判定しており、
         # GBPUSD/AUDUSD/GBPJPY が誤ってGOLDと同じ扱い(contract_size=100)になっていた。
@@ -137,16 +145,18 @@ class PortfolioFXEnv(gym.Env):
         
         # ランダムな開始位置の決定
         if self.fixed_start:
-            # テスト実行間で同じ期間を比較できるよう、常にデータ先頭から開始する
-            self.current_step = self.dataset.seq_length
+            # テスト実行間で同じ期間を比較できるよう、常にデータ先頭(episode_start_idx
+            # 指定時はその位置)から開始する
+            self.current_step = self.episode_start_idx if self.episode_start_idx is not None else self.dataset.seq_length
         else:
             # ランダムな開始位置の決定（学習時のみ）
             safe_max_start = len(self.dataset) - 1000
             self.current_step = np.random.randint(self.dataset.seq_length, max(safe_max_start, self.dataset.seq_length + 1))
 
         obs = self._get_observation()
-                    
-        while obs is None and self.current_step < len(self.dataset) - 1:
+
+        episode_end_for_done = self.episode_end_idx if self.episode_end_idx is not None else (len(self.dataset) - 1)
+        while obs is None and self.current_step < episode_end_for_done:
             self.current_step += 1
             obs = self._get_observation()
         
@@ -154,8 +164,10 @@ class PortfolioFXEnv(gym.Env):
         return obs, {"equity": self.equity}
 
     def _get_observation(self):
-        # 1. 範囲外アクセスの防止
-        if self.current_step >= len(self.dataset.df):
+        # 1. 範囲外アクセスの防止(episode_end_idx指定時は、dataset全体の末尾ではなく
+        # そのエピソードの範囲の末尾で止める)
+        episode_end_for_obs = self.episode_end_idx if self.episode_end_idx is not None else len(self.dataset.df)
+        if self.current_step >= episode_end_for_obs:
             return None
 
         # 2. 現在のステップの行データ（事前計算済みの予測結果を含む）を取得
@@ -396,11 +408,11 @@ class PortfolioFXEnv(gym.Env):
 
         self.prev_equity = self.equity
         self.current_step += 1
-        # 💡 修正: done=Trueになった理由(データ末尾到達 or 破産判定)を
-        # 切り分けて記録できるようにする(報酬・学習ロジック自体は変更していない。
-        # 従来通り両条件のどちらかでdone=True、破産時のみ-20.0のペナルティ)。
+        # 💡 修正: episode_end_idx指定時は、dataset全体の末尾ではなくそのエピソードの
+        # 範囲の末尾に達した時点でdone=Trueにする(未指定時は従来通りdataset全体の末尾)。
         is_bankrupt = self.equity <= self.initial_balance * 0.5
-        done = (self.current_step >= len(self.dataset) - 1) or is_bankrupt
+        episode_end_for_done = self.episode_end_idx if self.episode_end_idx is not None else (len(self.dataset) - 1)
+        done = (self.current_step >= episode_end_for_done) or is_bankrupt
 
         if is_bankrupt:
             reward -= 20.0
@@ -409,7 +421,7 @@ class PortfolioFXEnv(gym.Env):
         reward -= (drawdown_ratio **2) * DRAWDOWN_PENALTY_COEF
 
         next_obs = self._get_observation()
-        while next_obs is None and self.current_step < len(self.dataset) - 1:
+        while next_obs is None and self.current_step < episode_end_for_done:
             self.current_step += 1
             next_obs = self._get_observation()
 
