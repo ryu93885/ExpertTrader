@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+import sys
 import glob
 import logging
 import argparse
@@ -107,7 +108,11 @@ def main():
     files = glob.glob("processed_data/*_processed.csv")
     if not files:
         logging.error("The file to be processed cannot be found")
-        return
+        # 💡 修正(2026-11-06の調査で判明した問題への対応): run_pipeline.py/
+        # run_pipeline_FX.py のrun_script()はsubprocessの終了コードのみで
+        # 成否を判定しているため、素の「return」では終了コード0(成功)の
+        # まま静かに処理が打ち切られてしまう。sys.exit(1)に変更する。
+        sys.exit(1)
 
     processed_count = 0
 
@@ -152,6 +157,12 @@ def main():
         
     if processed_count == 0:
         logging.warning("No files matched the specified symbol/mode criteria.")
+        # 💡 修正(2026-11-06の調査で判明した問題への対応): run_pipeline.pyは
+        # 本スクリプトを --symbol X --mode Y と特定の銘柄・モードを指定して
+        # 呼び出すため、「0件処理」はそのsymbol/modeに対して何も生成できな
+        # かったことを意味する(後続のapply_scaler.py/split_data.py等が
+        # 空振りする原因になる)。これも異常終了として扱う。
+        sys.exit(1)
     else:
         logging.info(f"=== All processing complete. Processed {processed_count} files. ===")
 

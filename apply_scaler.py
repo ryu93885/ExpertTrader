@@ -1,6 +1,7 @@
 import pandas as pd
 import glob
 import os
+import sys
 import joblib
 import argparse
 import csv
@@ -39,7 +40,11 @@ def main():
 
     if not all_files:
         print(f"❌ {TARGET_MODE} モードの学習用データが見つかりません。")
-        return
+        # 💡 修正(2026-11-06の調査で判明した問題への対応): run_pipeline.py/
+        # run_pipeline_FX.py のrun_script()はsubprocessの終了コードのみで
+        # 成否を判定しているため、素の「return」では終了コード0(成功)の
+        # まま静かに処理が打ち切られてしまう。sys.exit(1)に変更する。
+        sys.exit(1)
     
     print(f"📁 {len(all_files)}個の学習データを読み込み、銘柄ごとに分類中...")
 
@@ -76,6 +81,15 @@ def main():
             
         symbol_features_map[symbol].append(df[features_columns])
         symbol_df_map[symbol].append(df)
+
+    # 💡 修正(2026-11-06の調査で判明した問題への対応): all_filesが1件以上あっても、
+    # 全ファイルがmissing_colsでスキップされた場合、symbol_features_mapが空のまま
+    # 以降の処理(スケーラーのfit・保存)が1件も実行されずに「成功」扱いで完了して
+        # しまっていた。空なら異常終了として扱う。
+    if not symbol_features_map:
+        print(f"❌ {TARGET_MODE} モードについて、スケーリング可能な銘柄が1件もありませんでした"
+              f"(全ファイルが特徴量不一致でスキップされました)。")
+        sys.exit(1)
 
     # 🌟 銘柄ごとに独立したスケーラーを構築・適用するメインループ
     scalers_dict = {}

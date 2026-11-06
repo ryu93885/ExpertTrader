@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import datetime,timezone,timedelta
 import logging
 import os
+import sys
 import argparse
 
 #definissioi of settings and conditions 
@@ -95,10 +96,19 @@ def main():
 
     args = parser.parse_args()
 
+    # 💡 修正(2026-11-06の調査で判明した問題への対応): 以下、本関数内のすべての
+    # 意図的な中断箇所(「return」のみ)は、呼び出し元(run_pipeline.py/
+    # run_pipeline_FX.pyのrun_script())がsubprocessの終了コードのみで成否を
+    # 判定しているため、この「return」では終了コード0(成功)のまま静かに
+    # 処理が打ち切られ、何も取得できていないにもかかわらず後続の
+    # preprocessing.py等がそのまま実行されてしまっていた
+    # (「data/ は更新されていないのに processed_data/ だけ更新履歴がある」
+    # という症状として現れた不具合の根本原因)。すべて sys.exit(1) に変更する。
     if not mt5.initialize():
         logging.critical(f"failed to initialize MT5")
-        return
+        sys.exit(1)
 
+    had_error = False
     try:
         # 1. stock select entry
         print("\n---stock select---")
@@ -117,7 +127,7 @@ def main():
         
         if not target_symbols:
             logging.error("no valid stock has been selected")
-            return 
+            sys.exit(1)
         
         # 2. mode select
         print("\n---mode select---")
@@ -135,7 +145,7 @@ def main():
 
         if not target_timeframes:
             logging.error("no valid mode was selected")
-            return
+            sys.exit(1)
         
         # 3. setting the period
         try:
@@ -143,7 +153,7 @@ def main():
             end_date = datetime.strptime(args.end, "%Y-%m-%d") if args.end else datetime.strptime(input("end date (YYYY-MM-DD): "), "%Y-%m-%d")
         except ValueError:
             print("[!] 日付のフォーマットが正しくありません。YYYY-MM-DD (例: 2024-01-01) の形式で入力してください。")
-            return
+            sys.exit(1)
 
         print(f"\n[*] Fetching data for {', '.join(target_symbols)} | Mode: {mode_input}")
         print(f"    Target Period : {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n")
@@ -158,6 +168,7 @@ def main():
 
     except Exception as e:
         logging.error(f"an error has occured:{e}",exc_info=True)
+        had_error = True
     finally:
         mt5.shutdown()
         try:
@@ -165,6 +176,9 @@ def main():
         except:
             pass
         logging.info(f"===complete(log:{log_file})===")
+
+    if had_error:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,7 @@
 import glob
 import os
 import logging
+import sys
 import pandas as pd
 import argparse
 import numpy as np
@@ -199,7 +200,11 @@ def main():
 
     if not symbols:
         logging.error("No stock has been specified.")
-        return
+        # 💡 修正(2026-11-06の調査で判明した問題への対応): run_pipeline.py/
+        # run_pipeline_FX.py のrun_script()はsubprocessの終了コードのみで
+        # 成否を判定しているため、素の「return」では終了コード0(成功)の
+        # まま静かに処理が打ち切られてしまう。sys.exit(1)に変更する。
+        sys.exit(1)
     
     # --- モード (Mode) の決定 ---
     if args.mode:
@@ -209,7 +214,7 @@ def main():
 
     if mode not in TRADING_MODE:
         logging.error("invalid mode")
-        return
+        sys.exit(1)
     
     # --- データ処理の実行 ---
     for symbol in symbols:
