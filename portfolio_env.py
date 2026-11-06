@@ -29,7 +29,11 @@ ENTRY_THRESHOLD_FLOOR = 0.05
 # 2〜3%台にしか達しておらず、リスク予算に大きな余力があることが判明したため、
 # この値もパラメータ化し、どこまで上げると信頼性(DD等)が問題になるかを
 # 検証できるようにする。
-RISK_PER_TRADE_PCT_DEFAULT = 0.02
+# 💡 更新(2026-11-06): entry_threshold_window=500 / entry_threshold_percentile=50 /
+# max_concurrent_positions=5との組み合わせで3分割の再現性検証を行った結果、
+# risk_per_trade_pct=7%が全期間で負の月がなく、平均月利・期間間のばらつきの
+# 両面で最も安定していたため、検証済みの最終値としてデフォルトを7%に更新する。
+RISK_PER_TRADE_PCT_DEFAULT = 0.07
 
 
 class PortfolioFXEnv(gym.Env):

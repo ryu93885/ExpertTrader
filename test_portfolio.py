@@ -138,16 +138,16 @@ def main():
     # 旧デフォルトは USDCAD/USDCHF を含んでおり、実際のシステムの銘柄構成と一致していなかった。
     parser.add_argument("--symbols",default=["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"])
     parser.add_argument("--mode",default = "short",help = "モード選択",choices = ["short","medium","long"])
-    # 💡 追加: 動的エントリー閾値・同時保有上限を手動で試したい場合用のオプション。
-    # 省略時はNone(動的閾値オフ・同時保有無制限)で、従来の固定閾値0.2のままになる。
-    parser.add_argument("--entry-threshold-window", type=int, default=None,
-                         help="動的エントリー閾値のローリングウィンドウ(銘柄ごとのサンプル数)。省略時は従来の固定閾値0.2のまま")
-    parser.add_argument("--entry-threshold-percentile", type=float, default=70,
+    # 💡 修正(2026-11-06): window=500 / percentile=50 / max_concurrent_positions=5 /
+    # risk_per_trade_pct=7%の組み合わせが、3分割の再現性検証で最も安定していたことが
+    # 確定したため、デフォルト値をこの検証済みの構成に更新する(他の値を試したい
+    # 場合は引数で上書きできる)。
+    parser.add_argument("--entry-threshold-window", type=int, default=500,
+                         help="動的エントリー閾値のローリングウィンドウ(銘柄ごとのサンプル数)")
+    parser.add_argument("--entry-threshold-percentile", type=float, default=50,
                          help="動的エントリー閾値に使うパーセンタイル")
-    parser.add_argument("--max-concurrent-positions", type=int, default=None,
-                         help="同時保有できる最大銘柄数。省略時は無制限")
-    # 💡 追加(2026-11-06): sweep_entry_threshold.pyと同様、1トレードあたりのリスク率を
-    # 手動で試せるようにする。省略時はportfolio_env.py側のデフォルト(2%)のまま。
+    parser.add_argument("--max-concurrent-positions", type=int, default=5,
+                         help="同時保有できる最大銘柄数")
     parser.add_argument("--risk-per-trade-pct", type=float, default=RISK_PER_TRADE_PCT_DEFAULT * 100.0,
                          help="1トレードあたりのリスク率(%, 口座残高に対する割合)")
     # 💡 追加(2026-11-06): テスト期間全体の単発バックテストに加えて、期間をN分割し
@@ -174,7 +174,7 @@ def main():
     log_file_path = os.path.join(results_dir, f"test_portfolio_{args.mode}_{timestamp}.log")
     setup_logger(log_file_path)
 
-    logging.info("test_portfolio.py ver213.0")
+    logging.info("test_portfolio.py ver214.0")
     if results_dir == DRIVE_TEST_RESULTS_DIR:
         logging.info(f"Google Driveを検出。テスト結果の保存先をDriveに設定します: {results_dir}")
     else:

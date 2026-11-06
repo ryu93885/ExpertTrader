@@ -10,7 +10,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.utils import LinearSchedule
 # 作成したモジュールをインポート
 from portfolio_dataset import PortfolioFXDataset
-from portfolio_env import PortfolioFXEnv
+from portfolio_env import PortfolioFXEnv, RISK_PER_TRADE_PCT_DEFAULT
 from model import MultimodalFXmodel  # 既存のアナライザモデル
 from sac_grad_clip import SACWithGradClip
 from rl_checkpoint_utils import get_checkpoint_dirs,resolve_model_paths
@@ -37,7 +37,7 @@ def setup_logger():
 
 def main():
     setup_logger()
-    logging.info("portfolio_portfolio_rl.py ver210.0")
+    logging.info("portfolio_portfolio_rl.py ver211.0")
 
     # 💡 修正: mode がCLI引数化されておらず常に"short"固定だったため、mediumモードで
     # 運用していても PortfolioFXDataset が images/{symbol}/short_MTF/ を探しに行き、
@@ -46,6 +46,22 @@ def main():
     # 事故があった。precompute_portfolio.py等と同じく --mode を明示指定できるようにする。
     parser = argparse.ArgumentParser(description="ポートフォリオRL(SAC)の学習")
     parser.add_argument("--mode", type=str, default="short", choices=["short", "medium", "long"], help="対象モード")
+    # 💡 追加(2026-11-06): これまでPortfolioFXEnv(dataset=dataset,symbols=symbols)としか
+    # 呼んでおらず、entry_threshold_window=None(動的閾値オフ)・percentile=70・
+    # max_concurrent_positions=None(無制限)・risk_per_trade_pct=2%という、
+    # sweep_entry_threshold.py/test_portfolio.pyでの3分割再現性検証より前の既定値の
+    # まま学習していた(検証済みパラメータが学習環境に一切反映されていなかった)。
+    # test_portfolio.pyと同じCLI引数を追加し、デフォルトを検証済みの値
+    # (window=500/percentile=50/max_concurrent_positions=5/risk_per_trade_pct=7%)に
+    # 揃える(再チューニング時は引数で上書きできる)。
+    parser.add_argument("--entry-threshold-window", type=int, default=500,
+                         help="動的エントリー閾値のローリングウィンドウ(銘柄ごとのサンプル数)")
+    parser.add_argument("--entry-threshold-percentile", type=float, default=50,
+                         help="動的エントリー閾値に使うパーセンタイル")
+    parser.add_argument("--max-concurrent-positions", type=int, default=5,
+                         help="同時保有できる最大銘柄数")
+    parser.add_argument("--risk-per-trade-pct", type=float, default=RISK_PER_TRADE_PCT_DEFAULT * 100.0,
+                         help="1トレードあたりのリスク率(%, 口座残高に対する割合)")
     args = parser.parse_args()
 
     # 1. 基本設定
@@ -68,7 +84,13 @@ def main():
     #3.アナライザのモデル読み込み(省略)
 
     # 4. 強化学習環境の構築
-    env = PortfolioFXEnv(dataset=dataset,symbols=symbols)
+    env = PortfolioFXEnv(
+        dataset=dataset, symbols=symbols,
+        entry_threshold_window=args.entry_threshold_window,
+        entry_threshold_percentile=args.entry_threshold_percentile,
+        max_concurrent_positions=args.max_concurrent_positions,
+        risk_per_trade_pct=args.risk_per_trade_pct / 100.0,
+    )
     vec_env = DummyVecEnv([lambda: env])
 
     vec_env = VecNormalize(
