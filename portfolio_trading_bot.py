@@ -13,6 +13,7 @@ import csv
 import gc
 import json
 import traceback
+from collections import deque
 
 # 💡 追加: プロセスのメモリ使用量を診断ログに残すための任意依存。
 # 未インストールでも起動を止めないよう、失敗時はNoneのままにする。
@@ -49,19 +50,33 @@ MIN_RR_RATIO = 1.5  # portfolio_env.py の学習時ロジックと一致させ�
 # 💡 サーキットブレーカー: self.recent_losses[sym](銘柄別の直近連敗数、0.9倍/サイクルで減衰)が
 # この値以上になったら、その銘柄への新規エントリーを一時停止する。3.0は概ね「短期間に3〜4回
 # 連敗した状態」に相当し、実際のテストトレードで見られたGBPJPY等の高速な同方向再エントリー連敗
-# (最大22連敗)を早期に遮断することを狙っている。値が下がれば(勝ちの有無に関わらず時間経過で
+# (最夢22連敗)を早期に遅断することを狙っている。値が下がれば(勝ちの有無に関わらず時間経過で
 # 自然減衰する)自動的に再開する。
 CIRCUIT_BREAKER_THRESHOLD = 3.0
 
 MAX_LOT_SIZE = 5.0  # portfolio_env.py の学習時ロジックと一致させるロット数の絶対上限
 
-# 💡 追加: 同時に保有できる最大銘柄数(ポートフォリオ全体)。今後エントリー閾値を
-# 動的化して取引頻度を上げる予定があり、間口を広げるほど、相関の強い複数銘柄が
-# 同時にシグナルを出した際の急変動への同時エクスポージャーが増える。そのリスクを
-# 抑えるための安全策として、閾値の変更に先行して導入する(この値自体は現状の
-# 固定閾値0.2のままでも機能する、独立した安全策)。portfolio_env.py の
-# max_concurrent_positions と同じ考え方・同じデフォルト値(4)。
-MAX_CONCURRENT_POSITIONS = 4
+# 💡 修正(2026-11-06): sweep_entry_threshold.py / test_portfolio.py による検証の結果、
+# window=500, percentile=50, max_concurrent_positions=5, risk_per_trade_pct=7% が
+# これまで検証した中で最も再現性の高い(期間を分割しても一貫してプラスを維持する)
+# 設定として採用された。portfolio_env.py の同名定数と一致させる。
+MAX_CONCURRENT_POSITIONS = 5
+
+# 💡 追加(2026-11-06): 固定閾値0.2から、portfolio_env.py の動的エントリー閾値
+# (銘柄ごとの直近のabs(act_direction)分布に基づくパーセンタイル)に変更する。
+# window=500: 銘柄ごとに直近500回分(約500サイクル=medium modeで約5.2日分)の
+# 行動の強さを保持する。percentile=50: その50パーセンタイル値を閾値とする。
+# サンプルがwindow分溢まるまではENTRY_THRESHOLD_FALLBACK(従来の固定値0.2)を使う
+# (起動直後・再起動直後は従来通りの振る舞いになる)。
+ENTRY_THRESHOLD_WINDOW = 500
+ENTRY_THRESHOLD_PERCENTILE = 50
+ENTRY_THRESHOLD_FALLBACK = 0.2
+ENTRY_THRESHOLD_FLOOR = 0.05
+
+# 💡 追加(2026-11-06): portfolio_env.py の RISK_PER_TRADE_PCT_DEFAULT と同じ役割。
+# 検証の結果、2%から7%に変更する(sweep_entry_threshold.py / test_portfolio.py の
+# --risk-per-trade-pct による検証を参照)。
+RISK_PER_TRADE_PCT = 0.07
 
 # 💡 追加: モデルの見直し(再学習判断・報酬設計の検証)に使うための診断ログ。
 # 自由記述のlogging.info()だけでは後から集計しづらいため、判断根拠(分析モデルの
@@ -112,6 +127,14 @@ class PortfolioFXTradingBot:
         # MT5の約定履歴から損失決済だったかを確認して更新する(_update_recent_losses参照)。
         self.recent_losses = {sym: 0.0 for sym in self.symbols}
         self._last_known_position = {sym: 0.0 for sym in self.symbols}
+
+        # 💡 追加(2026-11-06): portfolio_env.py の self.recent_abs_act_direction と
+        # 同じ役割。動的エントリー閾値の計算に使う、銘柄ごとの直近abs(act_direction)履歴。
+        # ボット再起動時はリセットされる(recent_losses等、既存の状態と同じ扱い)ため、
+        # 再起動直後はENTRY_THRESHOLD_WINDOW分(約5日)溢まるまでENTRY_THRESHOLD_FALLBACKで動く。
+        self.recent_abs_act_direction = {
+            sym: deque(maxlen=ENTRY_THRESHOLD_WINDOW) for sym in self.symbols
+        }
 
         # 💡 追加: モデル見直し用の診断ログ(判断ログ・約定結果ログ)の保存先
         self.decision_log_path = os.path.join(LOG_DIR, f"decision_log_{mode}.csv")
@@ -204,6 +227,17 @@ class PortfolioFXTradingBot:
         total_profit = sum(p.profit for p in positions if p.magic == MAGIC_NUMBER)
         return total_profit / max(balance, 1e-8)
 
+    def _compute_entry_threshold(self, sym):
+        """
+        💡 追加(2026-11-06): portfolio_env.py の _compute_entry_threshold と同じロジック。
+        サンプルがENTRY_THRESHOLD_WINDOW分溢まっていなければ、安全重視で固定閾値
+        (ENTRY_THRESHOLD_FALLBACK)にフォールバックする。
+        """
+        history = self.recent_abs_act_direction[sym]
+        if len(history) < ENTRY_THRESHOLD_WINDOW:
+            return ENTRY_THRESHOLD_FALLBACK
+        return max(np.percentile(history, ENTRY_THRESHOLD_PERCENTILE), ENTRY_THRESHOLD_FLOOR)
+
     def _init_csv_log(self, path, headers):
         """💡 追加: 診断ログ用CSVを、無ければヘッダー付きで新規作成する"""
         if not os.path.exists(path):
@@ -279,7 +313,7 @@ class PortfolioFXTradingBot:
         imgs_list = []
         tabs_list = []
         # 💡 B案: 銘柄埋め込み用のID。datafetch_modeltrain/model.py の SYMBOL_TO_ID を
-        # 唯一の対応表として使い、学習側とライブ側でズレないようにする。
+        # 唯一の対応表として使い、学習側とライブ側でずれないようにする。
         symbol_id_list = [SYMBOL_TO_ID[sym] for sym in self.symbols]
         raw_dfs = {}
 
@@ -460,6 +494,13 @@ class PortfolioFXTradingBot:
                 "equity": equity, "balance": balance,
             }
 
+            # 💡 追加(2026-11-06): portfolio_env.py の step() と同じく、ポジションの
+            # 有無に関わらず毎サイクル、銘柄ごとの直近abs(act_direction)履歴に追加する
+            # (動的エントリー閾値の計算に使う)。既存ポジション保持中でもここはスキップ
+            # しない(portfolio_env.py側もポジション有無を問わず毎ステップ追加しているため、
+            # ここでスキップすると学習・検証時より窓の埋まりが遅く・偏ったサンプルになる)。
+            self.recent_abs_act_direction[sym].append(abs(act_direction))
+
             if log_row["position_before"] != 0.0:
                 log_row["decision"] = "existing_position"
                 self._write_decision_log(log_row)
@@ -474,14 +515,15 @@ class PortfolioFXTradingBot:
                 logger.warning(f"🛑 [{sym}] サーキットブレーカー作動中(直近連敗数: {loss_streak:.2f})。新規エントリーを見送ります。")
                 continue
 
-            threshold = 0.2
+            # 💡 修正(2026-11-06): 固定値0.2から、portfolio_env.pyと同じ動的閾値に変更。
+            threshold = self._compute_entry_threshold(sym)
             if abs(act_direction) <= threshold:
                 log_row["decision"] = "below_threshold"
                 self._write_decision_log(log_row)
                 continue
 
             # 💡 追加: 同時保有銘柄数が上限に達している場合は新規エントリーを見送る
-            # (急な値動きへの対策。複数銘柄が同時にシグナルを出した場合の相関リスクを抑える)。
+            # (急な値動きへの対策。複数銘柄が同時にシグナルを出した場合の相関リスクを押える)。
             if concurrent_positions >= MAX_CONCURRENT_POSITIONS:
                 log_row["decision"] = "max_concurrent_positions"
                 self._write_decision_log(log_row)
@@ -512,8 +554,8 @@ class PortfolioFXTradingBot:
             if tp_dist < min_tp_dist:
                 tp_dist = min_tp_dist
 
-            # Envと完全に一致した動的ロット計算（リスク2%ベース）
-            risk_amount = equity * 0.02 * abs(act_direction)
+            # Envと完全に一致した動的ロット計算（リスクRISK_PER_TRADE_PCTベース）
+            risk_amount = equity * RISK_PER_TRADE_PCT * abs(act_direction)
 
             symbol_info = mt5.symbol_info(sym)
             if symbol_info and symbol_info.trade_tick_size > 0:
@@ -560,13 +602,16 @@ class PortfolioFXTradingBot:
             equity = account.equity
             symbol_info_cap = mt5.symbol_info(symbol)
 
-            # 💡 修正: 旧実装は「資産1000ドル/10万円あたり固定ロット」という、
+            # 💡 修正: 旧実装は「資甐1000ドル/10万円あたり固定ロット」という、
             # SL距離(sl_dist)を一切考慮しない静的な上限だった。このため、GOLDのように
             # ATRに応じてSL距離が広がる場面で、実際のリスクが意図した2%を大きく
             # 超過していた(実測でリスク6.9%〜12.2%、最大約6倍)。
-            # execute_trade_logic()の2%リスク計算と同じ sl_dist 連動のロジックで、
-            # その2倍(4%)を「通常あり得ないはずの異常値」に対する最終防衛ラインとする。
-            MAX_RISK_PCT_HARD_CAP = 0.04
+            # execute_trade_logic()のRISK_PER_TRADE_PCTリスク計算と同じ sl_dist 連動の
+            # ロジックで、その2倍を「通常あり得ないはずの異常値」に対する最終防衛ラインとする。
+            # 💡 修正(2026-11-06): RISK_PER_TRADE_PCTを2%→7%に変更したため、この上限も
+            # 連動して更新する(0.04のまま据え置くと、7%を狙った通常の注文がすべて
+            # この「異常値用」の上限に毎回引っかかり、変更が実質無効化されてしまうため)。
+            MAX_RISK_PCT_HARD_CAP = RISK_PER_TRADE_PCT * 2
             if symbol_info_cap and symbol_info_cap.trade_tick_size > 0 and sl_dist > 0:
                 loss_per_price_unit = symbol_info_cap.trade_tick_value / symbol_info_cap.trade_tick_size
                 loss_for_this_trade_per_lot = sl_dist * loss_per_price_unit
@@ -769,7 +814,7 @@ def main():
             logger.info("システムが手動で停止されました。")
             break
         except Exception as e:
-            logger.error(f"❌ 想定外のエラーが発生したため、60秒後に再起動します: {e}")
+            logger.error(f"❌ 想定外のエラーが発生したため。60秒後に再起動します: {e}")
             traceback.print_exc()
             write_heartbeat(mode, "error", str(e))
             time.sleep(60)
