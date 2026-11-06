@@ -56,16 +56,19 @@ def load_vec_env(env, vec_norm_path):
     return vec_env
 
 
-def run_split_validation(dataset, model, vec_norm_path, args, results_dir, timestamp):
+def run_split_validation(dataset, model, vec_norm_path, args, results_dir, timestamp, episode_start_idx=None):
     """
-    💡 追加(2026-11-06): テスト期間全体を使った単発のバッデテストだけでは、
+    💡 追加(2026-11-06): テスト期間全体を使った単発のバックテストだけでは、
     「特定の1期間に偶然当てはまっただけ(過学習)」なのか「どの期間でも概ね
     同程度の成績が出る(再現性がある)」のかを区別できない。テスト期間を
     --n-splits 個の連続する部分期間に分割し、各部分期間を(資金を初期値に
-    リセットした)独立したエピソードとして個別に検証することで、設定の頻健性を
-    確認できるようにする。
+    リセットした)独立したエピソードとして個別に検証することで、設定の
+    頻健性を確認できるようにする。
+
+    episode_start_idx が指定されている場合(--test-from-date併用時)は、
+    テストCSV全体ではなく、その開始位置以降の範囲だけを分割対象にする。
     """
-    full_start = dataset.seq_length
+    full_start = episode_start_idx if episode_start_idx is not None else dataset.seq_length
     full_end = len(dataset.df) - 1  # PortfolioFXEnvの無制限時のdone判定と同じ基準
     total_len = full_end - full_start
     split_size = total_len // args.n_splits
@@ -147,12 +150,21 @@ def main():
     # 手動で試せるようにする。省略時はportfolio_env.py側のデフォルト(2%)のまま。
     parser.add_argument("--risk-per-trade-pct", type=float, default=RISK_PER_TRADE_PCT_DEFAULT * 100.0,
                          help="1トレードあたりのリスク率(%, 口座残高に対する割合)")
-    # 💡 追加(2026-11-06): テスト期間全体の単発バッデテストに加えて、期間をN分割し
-    # 各期間を個別にバッデテストする再現性確認を行えるようにする。1(デフォルト)なら
+    # 💡 追加(2026-11-06): テスト期間全体の単発バックテストに加えて、期間をN分割し
+    # 各期間を個別にバックテストする再現性確認を行えるようにする。1(デフォルト)なら
     # 分割なし(従来通り単発のみ)。
     parser.add_argument("--n-splits", type=int, default=1,
                          help="再現性確認用に、テスト期間をいくつの連続した部分期間に分割して"
                               "個別に検証するか。1(デフォルト)なら分割なし")
+    # 💡 追加(2026-11-06): train/testの境界日を変えずに、テストCSVの末尾に新しく
+    # 追加された(=学習・これまでの検証のどちらにも使われていない)期間だけを
+    # 対象に検証したい場合用。省略時は従来通りテストCSVの先頭(dataset.seq_length)
+    # から検証する。--n-splitsと併用した場合、分割もこの開始日以降の範囲だけを
+    # 対象に行う。
+    parser.add_argument("--test-from-date", type=str, default=None,
+                         help="検証対象とする開始日時(例: 2026-08-27)。省略時はテストCSVの先頭から。"
+                              "test CSVの末尾に新しい期間を追加した場合に、その新しい部分だけを"
+                              "対象に検証するために使う")
     args = parser.parse_args()
 
     # 💡 追加: ログファイル・グラフの保存先を先に決定してからロガーを初期化することで、
@@ -162,7 +174,7 @@ def main():
     log_file_path = os.path.join(results_dir, f"test_portfolio_{args.mode}_{timestamp}.log")
     setup_logger(log_file_path)
 
-    logging.info("test_portfolio.py ver212.0")
+    logging.info("test_portfolio.py ver213.0")
     if results_dir == DRIVE_TEST_RESULTS_DIR:
         logging.info(f"Google Driveを検出。テスト結果の保存先をDriveに設定します: {results_dir}")
     else:
@@ -203,6 +215,27 @@ def main():
     logging.info("テスト用データセットを読み込んでいます....")
     dataset = PortfolioFXDataset(merged_csv_path=test_csv,base_img_dir=img_dir,symbols = args.symbols,mode = args.mode)
 
+    # 💡 追加(2026-11-06): --test-from-date が指定されていれば、その日時以降の
+    # 最初の行をエピソード開始位置にする(train/testの境界日自体は変更しない。
+    # test CSVの末尾に新しい期間を追加した場合、その新しい部分だけを対象に
+    # 検証するためのもの)。
+    episode_start_idx = None
+    if args.test_from_date:
+        from_ts = pd.to_datetime(args.test_from_date)
+        matching_idx = dataset.df.index[dataset.df["time"] >= from_ts]
+        if len(matching_idx) == 0:
+            logging.error(
+                f"❌ --test-from-date で指定された日時以降のデータがテストCSV内に"
+                f"見つかりません: {args.test_from_date}"
+            )
+            return
+        episode_start_idx = max(int(matching_idx[0]), dataset.seq_length)
+        logging.info(
+            f"📅 --test-from-date={args.test_from_date} が指定されたため、"
+            f"{dataset.df['time'].iloc[episode_start_idx]} 以降のみを検証対象にします"
+            f"(全{len(dataset.df)}行中、{len(dataset.df) - episode_start_idx}行が対象)"
+        )
+
     # 💡 修正: PortfolioFXEnv は prob_0/1/2・risk_val を precompute_portfolio.py が
     # 事前計算した列から直接読み込む設計(train_portfolio_rl.py と同じ)で、
     # アナリストモデルを直接渡す trained_model 引数はそもそも存在しない。
@@ -210,7 +243,7 @@ def main():
     # 使われていなかった(死んだコード)ため、丸ごと削除した。
 
     #テスト用環境の構築とvecnormalizeの復元
-    env = build_env(dataset, args)
+    env = build_env(dataset, args, episode_start_idx=episode_start_idx)
     vec_env = load_vec_env(env, vec_norm_path)
     logging.info("✅ VecNormalize の統計情報（平均・分散）をロードし、推論モードに設定しました。")
 
@@ -290,7 +323,7 @@ def main():
     initial_balance = env.initial_balance
     elapsed_days = None
     if step_count > 0:
-        start_idx = dataset.seq_length
+        start_idx = episode_start_idx if episode_start_idx is not None else dataset.seq_length
         end_idx = min(start_idx + step_count - 1, len(dataset.df) - 1)
         start_ts = pd.to_datetime(dataset.df["time"].iloc[start_idx])
         end_ts = pd.to_datetime(dataset.df["time"].iloc[end_idx])
@@ -303,7 +336,7 @@ def main():
     # 生データ(時刻・Equity・Balance)もCSVに保存する(下のPNGグラフは静止画のみで、
     # 後から詳しく見返したり自分でグラフを作り直したりすることができないため)。
     if step_count > 0:
-        start_idx = dataset.seq_length
+        start_idx = episode_start_idx if episode_start_idx is not None else dataset.seq_length
         times = dataset.df["time"].iloc[start_idx: start_idx + step_count].reset_index(drop=True)
         equity_curve_path = os.path.join(results_dir, f"portfolio_equity_curve_{args.mode}_{timestamp}.csv")
         equity_df = pd.DataFrame({
@@ -336,7 +369,7 @@ def main():
     # 💡 追加(2026-11-06): --n-splits > 1 の場合、テスト期間全体の単発バックテストに
     # 加えて、期間を分割した再現性確認も実行する。
     if args.n_splits > 1:
-        run_split_validation(dataset, model, vec_norm_path, args, results_dir, timestamp)
+        run_split_validation(dataset, model, vec_norm_path, args, results_dir, timestamp, episode_start_idx=episode_start_idx)
 
 
 if __name__ == "__main__":
