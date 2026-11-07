@@ -17,6 +17,7 @@ import sys
 import time
 import socket
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from torch.utils.data._utils.collate import default_collate
 
 from collections import Counter
@@ -40,6 +41,14 @@ DATASET_CACHE_DIR = "dataset_cache"
 DRIVE_FOLDER_NAME = "FX_AI_Models"  # 既存のモデル保存先と同じDriveフォルダを再利用する
 IMAGE_VALIDATION_LOG_INTERVAL = 1000  # この件数ごとに画像検証の進捗ログを出す
 DRIVE_UPLOAD_TIMEOUT_SECONDS = 180  # Driveアップロードがこの秒数を超えたらタイムアウトとして扱う
+# 💡 追加(2026-11-07の改修): 画像検証(os.path.exists/getsize + PNGのopen+verify)は
+# CPUではなくファイルI/O待ち(特にGoogle Driveマウント環境)が支配的なため、
+# スレッド並列化で大幅に高速化できる(GILはI/O待ち中に解放されるため)。
+VALIDATION_MAX_WORKERS = 16
+# この件数ごとに画像検証台帳をディスク(+Drive)へ保存する。1銘柄十万枚規模だと
+# 検証だけで数時間かかり得るため、Colabのセッション切断等が起きても、このチャンク
+# 単位でしか手戻りが発生しないようにする。
+LEDGER_CHECKPOINT_CHUNK_SIZE = 5000
 
 def calculate_auto_class_weights(csv_paths, method="sqrt", device="cpu", sample_ratio=0.2):
     """
@@ -232,31 +241,54 @@ def restore_ledger_from_drive_if_missing(local_path, drive_path, symbol):
         logging.info(f"📥 [{symbol}] Driveから画像検証キャッシュを復元しました: {drive_path}")
 
 
-def validate_images_with_progress(times, img_dir, symbol, log_interval=IMAGE_VALIDATION_LOG_INTERVAL):
+def validate_images_with_progress(times, img_dir, symbol, log_interval=IMAGE_VALIDATION_LOG_INTERVAL,
+                                   max_workers=VALIDATION_MAX_WORKERS):
     """
-    💡 追加(2026-11-07の改修): 1件ずつファイルI/O(PNGのopen+verify)を行うため、
-    件数が多いと無言のまま長時間止まっているように見えていた(「ログが少ないので
-    今どこで止まっているか分からない」という問題の原因の一つ)。log_interval件
-    ごとに進捗をログへ残す(ログ出力自体のコストはファイルI/Oに比べて無視できる
-    ほど小さく、学習・検証の停滞要因にはならない)。
+    💡 追加(2026-11-07の改修): 1件ずつ逐次でファイルI/O(os.path.exists/getsize +
+    PNGのopen+verify)を行っていたため、件数が多いと無言のまま長時間止まっている
+    ように見えていた上、実測で1000件あたり約90秒(Driveマウント環境でのI/O待ちが
+    支配的)かかっていた。チェックする内容自体(存在確認・サイズ確認・PNGとしての
+    デコード検証)は変えずに、以下の2点で高速化する:
+      1. ディレクトリの中身を os.scandir() で一度だけ一括取得し、画像ごとの
+         個別exists/getsize呼び出し(往復)を無くす。
+      2. 残るImage.open+verify()はCPUよりI/O待ちが支配的なため、
+         ThreadPoolExecutorで並列化する(GILはI/O待ち中に解放される)。
+    log_interval件ごとに進捗(処理速度含む)をログへ残す。
     """
-    n = len(times)
-    valid_mask = []
+    times_list = list(times)
+    n = len(times_list)
+
+    try:
+        dir_entries = {e.name: e.stat().st_size for e in os.scandir(img_dir)}
+    except FileNotFoundError:
+        dir_entries = {}
+
+    def _check_one(t):
+        filename = f"{t.strftime('%Y%m%d_%H%M%S')}.png"
+        size = dir_entries.get(filename, 0)
+        if size <= 0:
+            return False
+        img_path = os.path.join(img_dir, filename)
+        try:
+            with Image.open(img_path) as img:
+                img.verify()
+            return True
+        except Exception:
+            return False
+
+    valid_mask = [False] * n
     start_time = time.time()
-    for i, t in enumerate(times):
-        img_path = os.path.join(img_dir, f"{t.strftime('%Y%m%d_%H%M%S')}.png")
-        is_valid = False
-        if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-            try:
-                with Image.open(img_path) as img:
-                    img.verify()
-                is_valid = True
-            except Exception:
-                pass
-        valid_mask.append(is_valid)
-        if (i + 1) % log_interval == 0 or (i + 1) == n:
-            elapsed = time.time() - start_time
-            logging.info(f"  [{symbol}] 画像検証中: {i+1}/{n}件 ({elapsed:.1f}秒経過)")
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {executor.submit(_check_one, t): i for i, t in enumerate(times_list)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            valid_mask[idx] = future.result()
+            completed += 1
+            if completed % log_interval == 0 or completed == n:
+                elapsed = time.time() - start_time
+                rate = completed / elapsed if elapsed > 0 else 0.0
+                logging.info(f"  [{symbol}] 画像検証中: {completed}/{n}件 ({elapsed:.1f}秒経過, {rate:.1f}件/秒)")
     return valid_mask
 
 
@@ -394,14 +426,26 @@ def main():
         if len(new_rows_df) > 0:
             logging.info(
                 f"📦 [{symbol}] 画像検証キャッシュ: 既知{len(ledger_df)}件 / 新規{len(new_rows_df)}件を検証します"
+                f"({LEDGER_CHECKPOINT_CHUNK_SIZE}件ごとに台帳を保存し、途中で止まっても手戻りを抑えます)"
             )
-            new_valid_mask = validate_images_with_progress(new_rows_df["time"], current_img_dir, symbol)
-            new_ledger_rows = pd.DataFrame({"time": new_rows_df["time"].values, "is_valid": new_valid_mask})
-            ledger_df = pd.concat([ledger_df, new_ledger_rows], ignore_index=True)
-            ledger_df = ledger_df.drop_duplicates(subset=["time"], keep="last").sort_values("time")
-            ledger_df.to_csv(ledger_local_path, index=False)
-            if drive_service:
-                upload_to_drive_with_timeout(drive_service, ledger_local_path)
+            # 💡 追加(2026-11-07の改修): 大量件数(例: 1銘柄10万件規模)の初回検証は
+            # 時間がかかるため、LEDGER_CHECKPOINT_CHUNK_SIZE件ごとに台帳をディスク+
+            # Driveへ保存するようにする。Colabのセッション切断等が途中で起きても、
+            # 直近のチャンクまでの検証結果は失われない。
+            new_times_list = new_rows_df["time"].tolist()
+            for chunk_start in range(0, len(new_times_list), LEDGER_CHECKPOINT_CHUNK_SIZE):
+                chunk_times = new_times_list[chunk_start:chunk_start + LEDGER_CHECKPOINT_CHUNK_SIZE]
+                chunk_valid_mask = validate_images_with_progress(chunk_times, current_img_dir, symbol)
+                chunk_ledger_rows = pd.DataFrame({"time": chunk_times, "is_valid": chunk_valid_mask})
+                ledger_df = pd.concat([ledger_df, chunk_ledger_rows], ignore_index=True)
+                ledger_df = ledger_df.drop_duplicates(subset=["time"], keep="last").sort_values("time")
+                ledger_df.to_csv(ledger_local_path, index=False)
+                if drive_service:
+                    upload_to_drive_with_timeout(drive_service, ledger_local_path)
+                logging.info(
+                    f"💾 [{symbol}] 台帳チェックポイント保存: "
+                    f"{min(chunk_start + LEDGER_CHECKPOINT_CHUNK_SIZE, len(new_times_list))}/{len(new_times_list)}件まで完了"
+                )
         else:
             logging.info(f"📦 [{symbol}] 新規行なし。画像検証キャッシュ{len(ledger_df)}件をそのまま使用します")
 
