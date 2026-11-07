@@ -16,6 +16,7 @@ import shutil
 import sys
 import time
 import socket
+import errno
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from torch.utils.data._utils.collate import default_collate
@@ -49,6 +50,77 @@ VALIDATION_MAX_WORKERS = 16
 # 検証だけで数時間かかり得るため、Colabのセッション切断等が起きても、このチャンク
 # 単位でしか手戻りが発生しないようにする。
 LEDGER_CHECKPOINT_CHUNK_SIZE = 5000
+
+# 💡 追加(2026-11-07の改修): portfolio_dataset.py/precompute_portfolio.py(強化学習側)
+# と同様、Google Drive(FUSEマウント)への接続が一時的に切断されること
+# (OSError: [Errno 107] Transport endpoint is not connected / [Errno 5] Input/output
+# error)があるため、同じ考え方でリトリイを導入する。
+DRIVE_IO_MAX_RETRIES = 5
+DRIVE_IO_RETRY_BACKOFF_BASE = 10  # 秒。リトリイ毎に倍増(10, 20, 40, 80, 160秒)
+IMAGE_READ_MAX_RETRIES = 2
+IMAGE_READ_RETRY_BACKOFF_BASE = 2  # 秒(2, 4秒)。画像単位は件数が多いため短くする
+
+
+def _with_drive_retry(func, *args, **kwargs):
+    """
+    💡 追加(2026-11-07の改修): Google Drive(FUSEマウント)上のファイルを読み書きする
+    呼び出し(pd.read_csv・to_csv・torch.load/save・os.scandir・shutil.copy等)を、
+    一時的な接続切断(OSError: [Errno 107] Transport endpoint is not connected /
+    [Errno 5] Input/output error)に対してリトリイする汎用ラッパー。強化学習側
+    (portfolio_dataset.py/precompute_portfolio.py)と同じ実装・同じ定数にしている。
+    それ以外のエラーは即座に呼び出し元に伝える。
+    """
+    last_err = None
+    for attempt in range(DRIVE_IO_MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except OSError as e:
+            if e.errno not in (errno.ENOTCONN, errno.EIO):
+                raise
+            last_err = e
+            wait = DRIVE_IO_RETRY_BACKOFF_BASE * (2 ** attempt)
+            logging.warning(
+                f"⚠️ Google Driveへの接続が一時的に切断されたようです: {e}"
+                f" -- {wait}秒後に再試行します({attempt + 1}/{DRIVE_IO_MAX_RETRIES})"
+            )
+            time.sleep(wait)
+    raise last_err
+
+
+def _scan_dir_entries(img_dir):
+    return {e.name: e.stat().st_size for e in os.scandir(img_dir)}
+
+
+def _verify_image_with_retry(img_path, max_retries=IMAGE_READ_MAX_RETRIES,
+                              backoff_base=IMAGE_READ_RETRY_BACKOFF_BASE):
+    """
+    💡 追加(2026-11-07の改修): portfolio_dataset.py の _open_image_with_retry と同じ
+    考え方。画像検証は1画像ずつ頻繁に発生するため、_with_drive_retryより短い
+    間隔でリトリイする。Drive切断以外の例外(実際に壊れている画像)は即座にFalseを
+    返す。リトリイしても解消しない場合は、誤って「無効」とキャッシュに記録してしまう
+    (以後ずっと誤った結果を使い続けてしまう)のを避けるため、例外として上位に
+    伝播させる(呼び出し元のmain()がクラッシュし、ユーザーが気づける)。
+    """
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            with Image.open(img_path) as img:
+                img.verify()
+            return True
+        except OSError as e:
+            if e.errno not in (errno.ENOTCONN, errno.EIO):
+                return False
+            last_err = e
+            wait = backoff_base * (2 ** attempt)
+            logging.warning(
+                f"⚠️ Google Driveへの接続が一時的に切断されたようです: {img_path} ({e})"
+                f" -- {wait}秒後に再試行します({attempt + 1}/{max_retries})"
+            )
+            time.sleep(wait)
+        except Exception:
+            return False
+    raise last_err
+
 
 def calculate_auto_class_weights(csv_paths, method="sqrt", device="cpu", sample_ratio=0.2):
     """
@@ -237,7 +309,7 @@ def get_ledger_paths(symbol, mode):
 
 def restore_ledger_from_drive_if_missing(local_path, drive_path, symbol):
     if not os.path.exists(local_path) and os.path.exists(drive_path):
-        shutil.copy(drive_path, local_path)
+        _with_drive_retry(shutil.copy, drive_path, local_path)
         logging.info(f"📥 [{symbol}] Driveから画像検証キャッシュを復元しました: {drive_path}")
 
 
@@ -258,8 +330,12 @@ def validate_images_with_progress(times, img_dir, symbol, log_interval=IMAGE_VAL
     times_list = list(times)
     n = len(times_list)
 
+    # 💡 修正(2026-11-07の改修): os.scandir()もDrive上のディレクトリへのアクセスで
+    # あり、「OSError: [Errno 5] Input/output error: 'images/GBPUSD/medium_MTF'」の
+    # ように一時的な切断の対象になる。_with_drive_retryでリトリイする
+    # (FileNotFoundError=ディレクトリが本当に存在しない場合は従来通り空扱いにする)。
     try:
-        dir_entries = {e.name: e.stat().st_size for e in os.scandir(img_dir)}
+        dir_entries = _with_drive_retry(_scan_dir_entries, img_dir)
     except FileNotFoundError:
         dir_entries = {}
 
@@ -269,12 +345,7 @@ def validate_images_with_progress(times, img_dir, symbol, log_interval=IMAGE_VAL
         if size <= 0:
             return False
         img_path = os.path.join(img_dir, filename)
-        try:
-            with Image.open(img_path) as img:
-                img.verify()
-            return True
-        except Exception:
-            return False
+        return _verify_image_with_retry(img_path)
 
     valid_mask = [False] * n
     start_time = time.time()
@@ -317,7 +388,7 @@ class ScaledFXDataset(torch.utils.data.Dataset):
 
 def main():
     log_file = setup_logger()
-    logging.info(f"train.py ver2.0 (log: {log_file})")
+    logging.info(f"train.py ver2.1 (log: {log_file})")
     parser = argparse.ArgumentParser(description="FX Multiple training with date range")
     parser.add_argument("--mode", type=str, default="medium", choices=["short", "medium", "long"])
     parser.add_argument("--epochs", type=int, default=50)
@@ -399,7 +470,7 @@ def main():
         # だけを軽量な台帳としてDriveにも永続化し、次回以降は未検証の新規行だけを
         # 検証するように変更する(特徴量は毎回最新のscaled.csvから読むため、
         # apply_scaler.py再実行によるスケーラー更新も正しく反映される)。
-        df = pd.read_csv(csv_path)
+        df = _with_drive_retry(pd.read_csv, csv_path)
         df["time"] = pd.to_datetime(df["time"])
 
         if start_dt:
@@ -415,7 +486,7 @@ def main():
         restore_ledger_from_drive_if_missing(ledger_local_path, ledger_drive_path, symbol)
 
         if os.path.exists(ledger_local_path):
-            ledger_df = pd.read_csv(ledger_local_path)
+            ledger_df = _with_drive_retry(pd.read_csv, ledger_local_path)
             ledger_df["time"] = pd.to_datetime(ledger_df["time"])
         else:
             ledger_df = pd.DataFrame(columns=["time", "is_valid"])
@@ -439,7 +510,7 @@ def main():
                 chunk_ledger_rows = pd.DataFrame({"time": chunk_times, "is_valid": chunk_valid_mask})
                 ledger_df = pd.concat([ledger_df, chunk_ledger_rows], ignore_index=True)
                 ledger_df = ledger_df.drop_duplicates(subset=["time"], keep="last").sort_values("time")
-                ledger_df.to_csv(ledger_local_path, index=False)
+                _with_drive_retry(ledger_df.to_csv, ledger_local_path, index=False)
                 if drive_service:
                     upload_to_drive_with_timeout(drive_service, ledger_local_path)
                 logging.info(
@@ -472,12 +543,12 @@ def main():
         risk_std = train_df["target_risk_pct"].std() + 1e-8
         scaler_info[symbol] = {"mean": risk_mean, "std": risk_std}
 
-        test_df.to_csv(test_csv_path, index=False)
+        _with_drive_retry(test_df.to_csv, test_csv_path, index=False)
         logging.info(f"Saved test data for {symbol}: {len(test_df)} rows -> {test_csv_path}")
 
         tmp_train_csv_list.append(tmp_train_csv)
-        train_df.to_csv(tmp_train_csv, index=False)
-        val_df.to_csv(tmp_val_csv, index=False)
+        _with_drive_retry(train_df.to_csv, tmp_train_csv, index=False)
+        _with_drive_retry(val_df.to_csv, tmp_val_csv, index=False)
 
         tf_map = {"short":"M5","medium":"M15","long":"H4"}
         base_tf = tf_map.get(args.mode,"M15")
@@ -514,8 +585,10 @@ def main():
         sys.exit(1)
     
     
-    with open(f"saved_models/risk_scalers_{args.mode}.json", "w") as f:
-        json.dump(scaler_info, f, indent=4)
+    def _save_risk_scalers():
+        with open(f"saved_models/risk_scalers_{args.mode}.json", "w") as f:
+            json.dump(scaler_info, f, indent=4)
+    _with_drive_retry(_save_risk_scalers)
     
     full_train_ds = ConcatDataset(train_datasets)
     full_val_ds = ConcatDataset(val_datasets)
@@ -560,11 +633,11 @@ def main():
     if not os.path.exists(model_path) and os.path.exists(drive_model_path):
         logging.info(f"Model not found at local drive. Load from Google Drive;{drive_model_path}")
         os.makedirs(model_dir,exist_ok = True)
-        shutil.copy(drive_model_path,model_path)
+        _with_drive_retry(shutil.copy, drive_model_path, model_path)
     if os.path.exists(model_path):
         logging.info(f"[*] model_{args.mode} found")
         try:
-            checkpoint = torch.load(model_path,map_location=device,weights_only = False)
+            checkpoint = _with_drive_retry(torch.load, model_path, map_location=device, weights_only=False)
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -717,7 +790,7 @@ def main():
             best_val_total_loss = avg_val_total
             renewed = 0
             path = os.path.join(model_dir, f"best_total_model_{args.mode}.pth")
-            torch.save(checkpoint_data, path)
+            _with_drive_retry(torch.save, checkpoint_data, path)
             logging.info(f"✨ Saved Best TOTAL model: {path}")
 
 
@@ -725,7 +798,7 @@ def main():
             best_val_class_loss = avg_val_class
             renewed = 0
             path = os.path.join(model_dir, f"best_class_model_{args.mode}.pth")
-            torch.save(checkpoint_data,path)
+            _with_drive_retry(torch.save, checkpoint_data, path)
             logging.info(f"✨ Saved Best CLASS model: {path}")
 
 
@@ -733,7 +806,7 @@ def main():
             best_val_risk_loss = avg_val_risk
             renewed = 0
             path = os.path.join(model_dir, f"best_risk_model_{args.mode}.pth")
-            torch.save(checkpoint_data, path)
+            _with_drive_retry(torch.save, checkpoint_data, path)
             logging.info(f"✨ Saved Best RISK model: {path}")
 
         # 💡 修正(2026-11-07の改修): 毎エポックget_drive_service()を呼び直すのをやめ、
@@ -758,7 +831,7 @@ def main():
             break
 
         latest_path = os.path.join(model_dir, f"model_{args.mode}.pth")
-        torch.save(checkpoint_data, latest_path)
+        _with_drive_retry(torch.save, checkpoint_data, latest_path)
         logging.info(f"💾 エポック {epoch + 1} の状態を継続用として保存しました: {latest_path}")
 
 

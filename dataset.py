@@ -1,4 +1,6 @@
 import os
+import errno
+import time
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -10,6 +12,27 @@ from model import SYMBOL_TO_ID
 
 def setup_logger():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# 💡 追加(2026-11-07の改修): train.py経由でのDataLoader(num_workers>0)が、Google
+# Drive(FUSEマウント)上の画像を読む際に一時的な接続切断(OSError: [Errno 107]
+# Transport endpoint is not connected / [Errno 5] Input/output error)に遭遇する
+# ことがある。強化学習側のportfolio_dataset.py(_open_image_with_retry)と同じ
+# 考え方・同じ定数でリトリイする。
+IMAGE_READ_MAX_RETRIES = 2
+IMAGE_READ_RETRY_BACKOFF_BASE = 2  # 秒(2, 4秒)
+
+
+def _open_image_with_retry(img_path):
+    last_err = None
+    for attempt in range(IMAGE_READ_MAX_RETRIES):
+        try:
+            return Image.open(img_path).convert("RGB")
+        except OSError as e:
+            if e.errno not in (errno.ENOTCONN, errno.EIO):
+                raise
+            last_err = e
+            time.sleep(IMAGE_READ_RETRY_BACKOFF_BASE * (2 ** attempt))
+    raise last_err
 
 class FXMultimodalDataset(Dataset):
 
@@ -100,7 +123,7 @@ class FXMultimodalDataset(Dataset):
         img_path = os.path.join(self.img_dir, f"{time_str}.png")
         
         try:
-            image = Image.open(img_path).convert("RGB")
+            image = _open_image_with_retry(img_path)
             if self.transform:
                 image_tensor = self.transform(image)
 
