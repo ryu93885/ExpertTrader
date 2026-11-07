@@ -14,6 +14,9 @@ from PIL import Image
 import random
 import shutil
 import sys
+import time
+import socket
+from datetime import datetime
 from torch.utils.data._utils.collate import default_collate
 
 from collections import Counter
@@ -31,6 +34,12 @@ except ImportError:
     DRIVE_API_AVAILABLE = False
 
 SEQ_LENGTH = 40
+
+# 💡 追加(2026-11-07): データ準備(画像検証)のキャッシュ用ディレクトリ・設定。
+DATASET_CACHE_DIR = "dataset_cache"
+DRIVE_FOLDER_NAME = "FX_AI_Models"  # 既存のモデル保存先と同じDriveフォルダを再利用する
+IMAGE_VALIDATION_LOG_INTERVAL = 1000  # この件数ごとに画像検証の進捗ログを出す
+DRIVE_UPLOAD_TIMEOUT_SECONDS = 180  # Driveアップロードがこの秒数を超えたらタイムアウトとして扱う
 
 def calculate_auto_class_weights(csv_paths, method="sqrt", device="cpu", sample_ratio=0.2):
     """
@@ -98,9 +107,18 @@ def calculate_auto_class_weights(csv_paths, method="sqrt", device="cpu", sample_
 
 
 def setup_logger():
+    # 💡 修正(2026-11-07): 従来はコンソール出力のみで、Colab接続が切れた場合や
+    # 長時間ログを遡って見たい場合に、どこで停滞していたかを後から確認できなかった。
+    # fetch_data.py等、他のスクリプトと同じくファイルにも残すようにする。
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    log_filename = datetime.now().strftime(f"{log_dir}/train_%Y%m%d_%H%M%S.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[logging.FileHandler(log_filename, encoding="utf-8"), logging.StreamHandler()],
+    )
+    return log_filename
 
 def get_drive_service():
     if not DRIVE_API_AVAILABLE:
@@ -167,6 +185,81 @@ def upload_to_drive(service,local_path,folder_name = "FX_AI_Models"):
     except Exception as e:
         logging.error(f"Driveアップロード失敗 ({file_name}): {e}")
 
+
+def upload_to_drive_with_timeout(service, local_path, timeout_sec=DRIVE_UPLOAD_TIMEOUT_SECONDS):
+    """
+    💡 追加(2026-11-07の改修): upload_to_drive()本体(Google Drive API呼び出し)には
+    明示的なタイムアウトが無く、ネットワーク不調等で応答が返らない場合、ログに何も
+    残らないまま無期限に停滞しているように見えていた(「Driveにファイルを移植して
+    タイムアウトが発生するが、どこで止まっているか分からない」という問題の原因の
+    一つ)。開始・終了を明示的にログへ残し、socketの既定タイムアウトを一時的に
+    設定することでtimeout_sec秒を超えたら例外として検出できるようにする
+    (upload_to_drive内のtry/exceptで捕捉されログに残り、処理自体は継続する)。
+    """
+    if not os.path.exists(local_path):
+        return
+    file_name = os.path.basename(local_path)
+    file_size_mb = os.path.getsize(local_path) / 1e6
+    logging.info(f"☁️ Driveへのアップロード開始: {file_name} ({file_size_mb:.1f}MB, タイムアウト設定: {timeout_sec}秒)")
+    start_time = time.time()
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout_sec)
+    try:
+        upload_to_drive(service, local_path, folder_name=DRIVE_FOLDER_NAME)
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+        elapsed = time.time() - start_time
+        logging.info(f"☁️ Driveへのアップロード処理終了: {file_name} ({elapsed:.1f}秒経過)")
+
+
+def get_ledger_paths(symbol, mode):
+    """
+    💡 追加(2026-11-07の改修): 銘柄ごとの画像検証結果(time, is_valid)を軽量な
+    台帳としてキャッシュするためのパス。特徴量そのものはキャッシュしない
+    (apply_scaler.py再実行によるスケーラー更新を正しく反映させるため、特徴量は
+    毎回最新のlabeled_data/*_scaled.csvから読み直す)。
+    """
+    os.makedirs(DATASET_CACHE_DIR, exist_ok=True)
+    filename = f"image_validity_ledger_{symbol}_{mode}.csv"
+    local_path = os.path.join(DATASET_CACHE_DIR, filename)
+    drive_path = f"/content/drive/MyDrive/{DRIVE_FOLDER_NAME}/{filename}"
+    return local_path, drive_path
+
+
+def restore_ledger_from_drive_if_missing(local_path, drive_path, symbol):
+    if not os.path.exists(local_path) and os.path.exists(drive_path):
+        shutil.copy(drive_path, local_path)
+        logging.info(f"📥 [{symbol}] Driveから画像検証キャッシュを復元しました: {drive_path}")
+
+
+def validate_images_with_progress(times, img_dir, symbol, log_interval=IMAGE_VALIDATION_LOG_INTERVAL):
+    """
+    💡 追加(2026-11-07の改修): 1件ずつファイルI/O(PNGのopen+verify)を行うため、
+    件数が多いと無言のまま長時間止まっているように見えていた(「ログが少ないので
+    今どこで止まっているか分からない」という問題の原因の一つ)。log_interval件
+    ごとに進捗をログへ残す(ログ出力自体のコストはファイルI/Oに比べて無視できる
+    ほど小さく、学習・検証の停滞要因にはならない)。
+    """
+    n = len(times)
+    valid_mask = []
+    start_time = time.time()
+    for i, t in enumerate(times):
+        img_path = os.path.join(img_dir, f"{t.strftime('%Y%m%d_%H%M%S')}.png")
+        is_valid = False
+        if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+            try:
+                with Image.open(img_path) as img:
+                    img.verify()
+                is_valid = True
+            except Exception:
+                pass
+        valid_mask.append(is_valid)
+        if (i + 1) % log_interval == 0 or (i + 1) == n:
+            elapsed = time.time() - start_time
+            logging.info(f"  [{symbol}] 画像検証中: {i+1}/{n}件 ({elapsed:.1f}秒経過)")
+    return valid_mask
+
+
 def get_target_tfs(mode):
     if mode == "short": return ["M1", "M5", "M15"]
     elif mode == "medium": return ["M15", "H1", "H4"]
@@ -191,7 +284,8 @@ class ScaledFXDataset(torch.utils.data.Dataset):
         return img, tab, cls, scaled_risk, symbol_id
 
 def main():
-    setup_logger()
+    log_file = setup_logger()
+    logging.info(f"train.py ver2.0 (log: {log_file})")
     parser = argparse.ArgumentParser(description="FX Multiple training with date range")
     parser.add_argument("--mode", type=str, default="medium", choices=["short", "medium", "long"])
     parser.add_argument("--epochs", type=int, default=50)
@@ -203,6 +297,15 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
+
+    # 💡 修正(2026-11-07の改修): 従来はエポックのループ内で毎回get_drive_service()を
+    # 呼び直しており、不要な認証処理が繰り返されていた(Drive関連の遅延・停滞要因の
+    # 一つ)。データ準備時のキャッシュアップロードでも使うため、ここで一度だけ取得する。
+    drive_service = get_drive_service()
+    if drive_service:
+        logging.info("☁️ Google Drive連携: 有効")
+    else:
+        logging.info("☁️ Google Drive連携: 無効(ローカル保存のみ)")
 
     start_dt = pd.to_datetime(args.start) if args.start else None
     end_dt = pd.to_datetime(args.end) if args.end else None
@@ -255,73 +358,83 @@ def main():
         tmp_train_csv = f"temp_train_{symbol}_{args.mode}.csv"
         tmp_val_csv = f"temp_val_{symbol}_{args.mode}.csv"
         current_img_dir = os.path.join("images", symbol, f"{args.mode}_MTF")
-        
-        if os.path.exists(tmp_train_csv) and os.path.exists(tmp_val_csv) and os.path.exists(test_csv_path):
-            logging.info(f"✨ 既存の分割済みデータを読み込みます（画像整合性チェック・分割をスキップ）: {symbol}")
-            train_df = pd.read_csv(tmp_train_csv)
-            test_df = pd.read_csv(test_csv_path)
-            if first_train_df is None:
-                first_train_df = train_df
-            risk_mean = float(train_df["target_risk_pct"].mean())
-            risk_std = float(train_df["target_risk_pct"].std() + 1e-8)
-            scaler_info[symbol] = {"mean": risk_mean, "std": risk_std}
-            tmp_train_csv_list.append(tmp_train_csv)
-        
+
+        # 💡 修正(2026-11-07の改修): 従来は「前回の分割済みCSVがローカルに残っていれば
+        # 画像検証・分割を丸ごとスキップ、無ければ全行を毎回検証」という二択だった。
+        # しかしColab等のセッションは使い捨てで、実行終了時にtemp_*.csvも削除していた
+        # ため、この高速パスは実質一度も使われず「実行するたびにデータセットを用意」
+        # する状態になっていた。特徴量そのものではなく「画像検証結果(time, is_valid)」
+        # だけを軽量な台帳としてDriveにも永続化し、次回以降は未検証の新規行だけを
+        # 検証するように変更する(特徴量は毎回最新のscaled.csvから読むため、
+        # apply_scaler.py再実行によるスケーラー更新も正しく反映される)。
+        df = pd.read_csv(csv_path)
+        df["time"] = pd.to_datetime(df["time"])
+
+        if start_dt:
+            df = df[df["time"] >= start_dt]
+        if end_dt:
+            df = df[df["time"] <= end_dt]
+        if len(df) < 10:
+            logging.warning(f"Too little data for {symbol} in the given range. skipping")
+            continue
+        df = df.sort_values("time").reset_index(drop=True)
+
+        ledger_local_path, ledger_drive_path = get_ledger_paths(symbol, args.mode)
+        restore_ledger_from_drive_if_missing(ledger_local_path, ledger_drive_path, symbol)
+
+        if os.path.exists(ledger_local_path):
+            ledger_df = pd.read_csv(ledger_local_path)
+            ledger_df["time"] = pd.to_datetime(ledger_df["time"])
         else:
-            df = pd.read_csv(csv_path)
-            df["time"] = pd.to_datetime(df["time"])
+            ledger_df = pd.DataFrame(columns=["time", "is_valid"])
 
-            if start_dt:
-                df = df[df["time"] >= start_dt]
-            if end_dt:
-                df = df[df["time"] <= end_dt]
-            if len(df) < 10:
-                logging.warning(f"Too little data for {symbol} in the given range. skipping")
-                continue
-                
-            valid_mask = []
-            for t in df["time"]:
-                img_path = os.path.join(current_img_dir, f"{t.strftime('%Y%m%d_%H%M%S')}.png")
-                is_valid = False
-                if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                    try:
-                        with Image.open(img_path) as img:
-                            img.verify() 
-                        is_valid = True
-                    except Exception:
-                        pass
-                valid_mask.append(is_valid)
-                
-            missing_count = len(df) - sum(valid_mask)
-            if missing_count > 0:
-                logging.warning(f"⚠️ {symbol} にて {missing_count} 件の画像欠損または破損を検出。")
-                df = df[valid_mask].copy() 
-            else:
-                logging.info(f"✅ {symbol} の画像はすべて揃っており、正常です。")
-                
-            df = df.sort_values("time")
-            if first_train_df is None:
-                first_train_df = df
+        known_times = set(ledger_df["time"])
+        new_rows_df = df[~df["time"].isin(known_times)]
 
-            n = len(df)
-            train_idx = int(n * 0.70)
-            val_idx = train_idx + int(n * 0.20)
+        if len(new_rows_df) > 0:
+            logging.info(
+                f"📦 [{symbol}] 画像検証キャッシュ: 既知{len(ledger_df)}件 / 新規{len(new_rows_df)}件を検証します"
+            )
+            new_valid_mask = validate_images_with_progress(new_rows_df["time"], current_img_dir, symbol)
+            new_ledger_rows = pd.DataFrame({"time": new_rows_df["time"].values, "is_valid": new_valid_mask})
+            ledger_df = pd.concat([ledger_df, new_ledger_rows], ignore_index=True)
+            ledger_df = ledger_df.drop_duplicates(subset=["time"], keep="last").sort_values("time")
+            ledger_df.to_csv(ledger_local_path, index=False)
+            if drive_service:
+                upload_to_drive_with_timeout(drive_service, ledger_local_path)
+        else:
+            logging.info(f"📦 [{symbol}] 新規行なし。画像検証キャッシュ{len(ledger_df)}件をそのまま使用します")
 
-            train_df = df.iloc[:train_idx].copy()
-            val_df = df.iloc[train_idx:val_idx].copy()
-            test_df = df.iloc[val_idx:].copy()
+        merged = df.merge(ledger_df, on="time", how="left")
+        missing_count = int((~merged["is_valid"].fillna(False)).sum())
+        if missing_count > 0:
+            logging.warning(f"⚠️ {symbol} にて {missing_count} 件の画像欠損または破損を検出。")
+        else:
+            logging.info(f"✅ {symbol} の画像はすべて揃っており、正常です。")
+        df = merged[merged["is_valid"].fillna(False)].drop(columns=["is_valid"]).copy()
 
-            risk_mean = train_df["target_risk_pct"].mean()
-            risk_std = train_df["target_risk_pct"].std() + 1e-8
-            scaler_info[symbol] = {"mean": risk_mean, "std": risk_std}
-            
-            test_df.to_csv(test_csv_path, index=False)
-            logging.info(f"Saved test data for {symbol}: {len(test_df)} rows -> {test_csv_path}")
+        if first_train_df is None:
+            first_train_df = df
 
-            tmp_train_csv_list.append(tmp_train_csv)
-            train_df.to_csv(tmp_train_csv, index=False)
-            val_df.to_csv(tmp_val_csv, index=False)
-            
+        n = len(df)
+        train_idx = int(n * 0.70)
+        val_idx = train_idx + int(n * 0.20)
+
+        train_df = df.iloc[:train_idx].copy()
+        val_df = df.iloc[train_idx:val_idx].copy()
+        test_df = df.iloc[val_idx:].copy()
+
+        risk_mean = train_df["target_risk_pct"].mean()
+        risk_std = train_df["target_risk_pct"].std() + 1e-8
+        scaler_info[symbol] = {"mean": risk_mean, "std": risk_std}
+
+        test_df.to_csv(test_csv_path, index=False)
+        logging.info(f"Saved test data for {symbol}: {len(test_df)} rows -> {test_csv_path}")
+
+        tmp_train_csv_list.append(tmp_train_csv)
+        train_df.to_csv(tmp_train_csv, index=False)
+        val_df.to_csv(tmp_val_csv, index=False)
+
         tf_map = {"short":"M5","medium":"M15","long":"H4"}
         base_tf = tf_map.get(args.mode,"M15")
         current_img_dir = os.path.join("images",symbol,f"{args.mode}_MTF")
@@ -447,12 +560,19 @@ def main():
 
     patience = 5
     
+    # 💡 追加(2026-11-07の改修): train_loader・val_loaderそれぞれのバッチ数をログに
+    # 残しておく。「今何バッチ目か」の進捗ログ(下記BATCH_LOG_INTERVAL)と合わせて見ることで、
+    # 現在どの程度進んでいるかが分かるようにする。
+    BATCH_LOG_INTERVAL = 50
+    logging.info(f"📊 1エポックあたりのバッチ数: Train={len(train_loader)}, Val={len(val_loader)}")
+
     for epoch in range(start_epoch,args.epochs):
+        logging.info(f"▶️ エポック{epoch+1}/{args.epochs}: 学習ループを開始します")
         model.train()
         train_loss = 0
         train_class_loss = 0
         train_risk_loss = 0
-        for batch_data in tqdm(train_loader,desc = f"Epoch {epoch+1}"):
+        for batch_idx, batch_data in enumerate(tqdm(train_loader,desc = f"Epoch {epoch+1}")):
             if batch_data is None:
                 continue
             imgs,tabs,cls,risks,symbol_ids = batch_data
@@ -476,19 +596,25 @@ def main():
             train_loss += loss.item()
             train_class_loss += loss_c.item()
             train_risk_loss += loss_r.item()
-        
+
+            # 💡 追加: tqdmの進捗バーは標準出力のみでログファイルには残らないため、
+            # ログファイル側にも一定間隔でバッチ進捗を残す(コスト無視できる頻度)。
+            if (batch_idx + 1) % BATCH_LOG_INTERVAL == 0:
+                logging.info(f"  [Train] バッチ {batch_idx+1}/{len(train_loader)} (loss={loss.item():.6f})")
+
         avg_train_total = train_loss / len(train_loader)
         avg_train_class = train_class_loss / len(train_loader)
         avg_train_risk = train_risk_loss / len(train_loader)
 
         # バリデーション
+        logging.info(f"▶️ エポック{epoch+1}/{args.epochs}: 検証(validation)ループを開始します")
         model.eval()
         val_total_loss = 0
         val_class_loss = 0
         val_risk_loss = 0
 
         with torch.no_grad():
-            for batch_data in val_loader:
+            for batch_idx, batch_data in enumerate(tqdm(val_loader, desc=f"Epoch {epoch+1} [Val]")):
                 if batch_data is None:
                     continue
                 imgs,tabs,cls,risks,symbol_ids = batch_data
@@ -501,10 +627,13 @@ def main():
                 loss_r = criterion_risk(ork, risks)
                 loss = 0.5 * torch.exp(-log_var_c) * loss_c + 0.5 * log_var_c + \
        0.5 * torch.exp(-log_var_r) * loss_r + 0.5 * log_var_r
-                
+
                 val_total_loss += loss.item()
                 val_class_loss += loss_c.item()
                 val_risk_loss += loss_r.item()
+
+                if (batch_idx + 1) % BATCH_LOG_INTERVAL == 0:
+                    logging.info(f"  [Val] バッチ {batch_idx+1}/{len(val_loader)}")
         
         avg_val_total = val_total_loss / len(val_loader)
         avg_val_class = val_class_loss / len(val_loader)
@@ -538,6 +667,8 @@ def main():
         }
         renewed += 1
 
+        logging.info(f"💾 エポック{epoch+1}/{args.epochs}: チェックポイント保存処理を開始します")
+
         if avg_val_total < best_val_total_loss:
             best_val_total_loss = avg_val_total
             renewed = 0
@@ -545,7 +676,7 @@ def main():
             torch.save(checkpoint_data, path)
             logging.info(f"✨ Saved Best TOTAL model: {path}")
 
-        
+
         if avg_val_class < best_val_class_loss:
             best_val_class_loss = avg_val_class
             renewed = 0
@@ -553,16 +684,21 @@ def main():
             torch.save(checkpoint_data,path)
             logging.info(f"✨ Saved Best CLASS model: {path}")
 
-        
+
         if avg_val_risk < best_val_risk_loss:
             best_val_risk_loss = avg_val_risk
             renewed = 0
             path = os.path.join(model_dir, f"best_risk_model_{args.mode}.pth")
             torch.save(checkpoint_data, path)
             logging.info(f"✨ Saved Best RISK model: {path}")
-        
-        drive_service = get_drive_service()
+
+        # 💡 修正(2026-11-07の改修): 毎エポックget_drive_service()を呼び直すのをやめ、
+        # main()冒頭で一度だけ取得したdrive_serviceを再利用する(不要な認証処理の
+        # 削減)。アップロードもupload_to_drive_with_timeout()経由にし、開始・終了の
+        # ログとタイムアウトを明示的に付与する(「Driveへの転送でタイムアウトが
+        # 発生するが、どこで止まっているか分からない」問題への対応)。
         if drive_service:
+            logging.info(f"☁️ エポック{epoch+1}/{args.epochs}: Driveへのモデルアップロードを開始します(4ファイル)")
             models_to_upload = [
                 os.path.join(model_dir, f"best_total_model_{args.mode}.pth"),
                 os.path.join(model_dir, f"best_class_model_{args.mode}.pth"),
@@ -570,13 +706,13 @@ def main():
                 os.path.join(model_dir, f"model_{args.mode}.pth")
             ]
             for m_path in models_to_upload:
-                upload_to_drive(drive_service, m_path)
-                logging.info(f"m_path:{m_path},drive_service:{drive_service}")
+                upload_to_drive_with_timeout(drive_service, m_path)
+            logging.info(f"☁️ エポック{epoch+1}/{args.epochs}: Driveへのモデルアップロードが完了しました")
 
         if renewed == patience:
             logging.info(f"Early stop triggered")
             break
-        
+
         latest_path = os.path.join(model_dir, f"model_{args.mode}.pth")
         torch.save(checkpoint_data, latest_path)
         logging.info(f"💾 エポック {epoch + 1} の状態を継続用として保存しました: {latest_path}")
