@@ -379,7 +379,17 @@ class ScaledFXDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        img, tab, cls, risk, symbol_id = self.dataset[idx]
+        # 💡 修正(2026-11-09の調査で判明した問題への対応): FXMultimodalDataset側は
+        # 画像読み込み失敗時に意図的にNoneを返す設計(safe_collate_fnがバッチから
+        # 除外する前提)だが、ここで無条件にアンパックしていたため、None が返った
+        # 瞬間に「cannot unpack non-iterable NoneType object」でクラッシュしていた
+        # (Drive再接続直後の不安定な時間帯に、_open_image_with_retryがリトリイを
+        # 使い切った場合に発生)。Noneはそのまま伝播させ、safe_collate_fn側で
+        # 正しく除外されるようにする。
+        sample = self.dataset[idx]
+        if sample is None:
+            return None
+        img, tab, cls, risk, symbol_id = sample
         if isinstance(risk, torch.Tensor):
             scaled_risk = (risk - self.mean) / self.std
         else:
