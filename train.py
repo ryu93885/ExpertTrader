@@ -398,7 +398,7 @@ class ScaledFXDataset(torch.utils.data.Dataset):
 
 def main():
     log_file = setup_logger()
-    logging.info(f"train.py ver2.2 (log: {log_file})")
+    logging.info(f"train.py ver2.3 (log: {log_file})")
     parser = argparse.ArgumentParser(description="FX Multiple training with date range")
     parser.add_argument("--mode", type=str, default="medium", choices=["short", "medium", "long"])
     parser.add_argument("--epochs", type=int, default=50)
@@ -697,7 +697,16 @@ def main():
                 best_val_total_loss = checkpoint.get('best_val_total_loss', float('inf'))
                 best_val_class_loss = checkpoint.get("best_val_class_loss",float("inf"))
                 best_val_risk_loss = checkpoint.get("best_val_risk_loss",float("inf"))
-                renewed = checkpoint.get("renewed",0)
+                # 💡 修正(2026-11-13の調査で判明した問題への対応): 従来は早期停止の
+                # 連続無改善カウンタ(renewed)もそのまま復元しており、前回「5エポック
+                # 連続無改善」で早期停止した直後のチェックポイントから再開すると、
+                # 復元直後からわずか1エポックの無改善で再び早期停止してしまい、
+                # データ追加や凍結設定の変更を試す余地がほとんど無かった。再開は
+                # ユーザーが明示的に「もう一度試す」という判断をした結果なので、
+                # ここでは0にリセットし、新しいpatience分の様子見ができるようにする。
+                # (best_val_*_lossは「過去最高を超えたか」の指標として引き続き意味が
+                # あるため、こちらは復元したままにする)
+                renewed = 0
                 logging.info(f"✅ オプティマイザとスケジューラを復元しました。エポック {start_epoch} から再開します。")
             else:
                 # 従来の重みのみのファイルだった場合
