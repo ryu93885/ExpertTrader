@@ -2,6 +2,48 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 
+# 💡 追加(2026-11-13の改修): ResNet50バックボーンを丸ごとfine-tuningしており、
+# 学習時間・GPUメモリの両面でコストが大きい。転移学習の一般的な知見では、CNNの
+# 浅い層(conv1・layer1・layer2)はエッジ・テクスチャ等の汎用的な特徴を学習して
+# おり、画像ドメインが変わっても比較的そのまま転用しやすい。一方、深い層
+# (layer3・layer4)はImageNet(自然画像)に特化した高次の特徴を学習しているため、
+# ローソク足チャート画像のような全く異なる画像ドメインでは、ある程度の再学習
+# (fine-tuning)が必要になりやすい、というのが標準的な転移学習の考え方。
+# この知見に基づき、複数の「どこまで凍結するか」の選択肢を用意し、学習時間と
+# 精度のトレードオフを実際の学習で比較検証できるようにする。
+# ⚠️ 本環境ではGPUでの実データ学習・比較ができないため、実際の精度への影響は
+# 確証が無い(一般的な転移学習の知見に基づく推奨にとどまる)。"none"(従来通り)
+# との比較を、実際の学習で行うことを推奨する。
+RESNET_FREEZE_PRESETS = {
+    "none": [],  # 従来通り全層をfine-tuning(基準点。学習コストは最大だが、
+                 # 凍結による精度低下リスクも無い)
+    "stem": ["conv1", "bn1"],  # 最初の畳み込み層のみ凍結。影響は最小限と予想される
+    "early": ["conv1", "bn1", "layer1", "layer2"],  # 推奨の出発点。浅い層(汎用的な
+                                                      # 特徴)を凍結し、ドメイン適応が
+                                                      # 必要になりやすい深い層
+                                                      # (layer3・layer4)のみ学習する
+    "early_plus_layer3": ["conv1", "bn1", "layer1", "layer2", "layer3"],  # より積極的な
+        # 凍結。学習コストはさらに下がるが、layer3もドメイン適応できなくなるため、
+        # "early"より精度低下のリスクが高いと考えられる
+}
+
+
+def freeze_resnet_layers(resnet: nn.Module, preset: str) -> int:
+    """
+    resnetの指定したpreset名に対応する子モジュール(例: layer1・layer2)を
+    requires_grad=Falseにする。戻り値は凍結したパラメータ数(ログ用)。
+    """
+    if preset not in RESNET_FREEZE_PRESETS:
+        raise ValueError(f"未知のfreeze preset: '{preset}'. 選択肢: {list(RESNET_FREEZE_PRESETS.keys())}")
+    frozen_names = RESNET_FREEZE_PRESETS[preset]
+    frozen_param_count = 0
+    for name, module in resnet.named_children():
+        if name in frozen_names:
+            for param in module.parameters():
+                param.requires_grad = False
+                frozen_param_count += param.numel()
+    return frozen_param_count
+
 # 💡 B案: 銘柄埋め込み(symbol embedding)のための、銘柄名↔ID対応表。
 # portfolio_trading_bot.py の TARGET_SYMBOLS・train_portfolio_rl.py の symbols 等、
 # 既存のポートフォリオ関連スクリプトで使われている並び順と完全に一致させている。
@@ -15,7 +57,8 @@ NUM_SYMBOLS = len(SYMBOL_LIST)
 
 class MultimodalFXmodel(nn.Module):
 
-    def __init__(self,num_tabular_features = 32,num_classes = 3,num_symbols = NUM_SYMBOLS,symbol_embed_dim = 8):
+    def __init__(self,num_tabular_features = 32,num_classes = 3,num_symbols = NUM_SYMBOLS,symbol_embed_dim = 8,
+                 freeze_backbone = "none"):
         """
         Multimodal Multitask FX Forecasting Model
 
@@ -24,6 +67,8 @@ class MultimodalFXmodel(nn.Module):
             num_classes (int): Number of classes for classification tasks (assumes three classes: Long=1, Hold=0, Short=-1)
             num_symbols (int): 銘柄埋め込みの語彙数(対応する銘柄の総数)
             symbol_embed_dim (int): 銘柄埋め込みベクトルの次元数
+            freeze_backbone (str): RESNET_FREEZE_PRESETSのいずれか。ResNet50バックボーンの
+                どこまでを凍結するか("none"なら従来通り全層をfine-tuning)。
         """
         super(MultimodalFXmodel,self).__init__()
 
@@ -40,6 +85,11 @@ class MultimodalFXmodel(nn.Module):
         #delete the last classifier
         cnn_out_features = self.cnn.fc.in_features
         self.cnn.fc = nn.Identity()
+
+        # 💡 追加(2026-11-13の改修): freeze_backboneで指定した範囲のResNet50の層を
+        # 凍結する("none"の場合は従来通り何も凍結しない)。凍結したパラメータ数を
+        # 呼び出し元(train.py)がログへ残せるよう、インスタンス属性として保持する。
+        self.frozen_backbone_param_count = freeze_resnet_layers(self.cnn, freeze_backbone)
 
         self.cnn_compressor = nn.Sequential(
             nn.Linear(cnn_out_features, 64),

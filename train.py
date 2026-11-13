@@ -11,7 +11,7 @@ from tqdm import tqdm
 import argparse
 import json
 from PIL import Image
-import random
+# import random  # 💡 2026-11-13時点で未使用。今後削除する可能性あり
 import shutil
 import sys
 import time
@@ -22,8 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from torch.utils.data._utils.collate import default_collate
 
 from collections import Counter
-from model import MultimodalFXmodel
-from dataset import FXMultimodalDataset
+from model import MultimodalFXmodel, RESNET_FREEZE_PRESETS
+from dataset import FXMultimodalDataset, EXCLUDE_COLS
 
 
 try:
@@ -398,7 +398,7 @@ class ScaledFXDataset(torch.utils.data.Dataset):
 
 def main():
     log_file = setup_logger()
-    logging.info(f"train.py ver2.1 (log: {log_file})")
+    logging.info(f"train.py ver2.2 (log: {log_file})")
     parser = argparse.ArgumentParser(description="FX Multiple training with date range")
     parser.add_argument("--mode", type=str, default="medium", choices=["short", "medium", "long"])
     parser.add_argument("--epochs", type=int, default=50)
@@ -406,6 +406,12 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--start", type=str, help="start date(xxxx-xx-xx)")
     parser.add_argument("--end", type=str, help="end date(xxxx-xx-xx)")
+    # 💡 追加(2026-11-13の改修): ResNet50バックボーンの一部を凍結して学習時間を
+    # 短縮する選択肢。詳細・精度への影響の考え方はmodel.pyのRESNET_FREEZE_PRESETS
+    # 参照。デフォルトは"none"(従来通り全層fine-tuning)で、既存の挙動は変えない。
+    parser.add_argument("--freeze-backbone", type=str, default="none",
+                         choices=list(RESNET_FREEZE_PRESETS.keys()),
+                         help="ResNet50バックボーンの凍結範囲。noneなら従来通り全層をfine-tuning")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -619,14 +625,27 @@ def main():
     )
     # モデル・学習設定
     # first_train_df を使って input_dim を設定
-    input_dim = first_train_df.shape[1] - 5
-    model = MultimodalFXmodel(num_tabular_features=input_dim).to(device)
+    # 💡 修正(2026-11-13の調査で判明した問題への対応): 「5」という決め打ちの値
+    # ではなく、dataset.pyのEXCLUDE_COLS(特徴量から除外する列)の件数を直接参照する。
+    # ラベル生成側の列数が将来変わっても、ここが自動的に追従する。
+    input_dim = first_train_df.shape[1] - len(EXCLUDE_COLS)
+    model = MultimodalFXmodel(num_tabular_features=input_dim, freeze_backbone=args.freeze_backbone).to(device)
+    if model.frozen_backbone_param_count > 0:
+        logging.info(
+            f"🧊 ResNet50バックボーンを一部凍結しました(--freeze-backbone={args.freeze_backbone}, "
+            f"凍結パラメータ数={model.frozen_backbone_param_count:,})"
+        )
     log_var_c = torch.zeros(1, requires_grad=True, device=device)
     log_var_r = torch.zeros(1, requires_grad=True, device=device)
     model_dir = "saved_model"
     os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, f"model_{args.mode}.pth") # .pth に統一
-    optimizer = optim.Adam(list(model.parameters()) + [log_var_c, log_var_r], lr=args.lr, weight_decay=1e-4)
+    # 💡 修正(2026-11-13の改修): --freeze-backboneで凍結したパラメータ
+    # (requires_grad=False)はoptimizerに渡しても実害はない(勾配が無いため更新
+    # されない)が、Adamの内部状態(モーメンタム等)を無駄に保持してしまう。
+    # 凍結の目的(学習コスト削減)に合わせ、学習対象のパラメータのみに絞る。
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adam(trainable_params + [log_var_c, log_var_r], lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
     start_epoch = 0
@@ -650,7 +669,25 @@ def main():
             checkpoint = _with_drive_retry(torch.load, model_path, map_location=device, weights_only=False)
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                # 💡 修正(2026-11-13の改修): --freeze-backboneを導入したことで、
+                # 「このチェックポイントを保存した時」と「今回読み込む時」で凍結範囲が
+                # 異なると、trainable_paramsの件数がズレ、optimizer.load_state_dict()が
+                # 内部のparam_groupサイズ不一致でエラーになる(PyTorchの仕様)。この
+                # エラー自体は#2の修正でsys.exit(1)するようになったため、「同じモデルを
+                # 違うfreeze-backbone設定で再開したい」という自然な使い方が、原因の
+                # わかりにくいクラッシュになってしまう。モデルの重み自体は凍結範囲に
+                # 関係なく読み込めるため、凍結設定が変わった場合はoptimizerの状態
+                # (モーメンタム等)のみ初期化し直し、学習自体は継続できるようにする。
+                checkpoint_args = checkpoint.get('args')
+                checkpoint_freeze_backbone = getattr(checkpoint_args, 'freeze_backbone', 'none')
+                if checkpoint_freeze_backbone == args.freeze_backbone:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                else:
+                    logging.warning(
+                        f"⚠️ --freeze-backboneが前回の学習({checkpoint_freeze_backbone})と今回"
+                        f"({args.freeze_backbone})で異なるため、optimizerの状態(モーメンタム等)は"
+                        f"初期化します。モデルの重み・エポック数等は引き続き復元されます。"
+                    )
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 if 'log_var_c' in checkpoint and 'log_var_r' in checkpoint:
                     with torch.no_grad():
@@ -667,7 +704,16 @@ def main():
                 model.load_state_dict(checkpoint)
                 logging.info("ℹ️ 重みデータのみを読み込みました（オプティマイザ等は初期化されます）")
         except Exception as e:
-            logging.info(f"Errror occured for loading moddel{e}")
+            # 💡 修正(2026-11-13の調査で判明した問題への対応): 従来はここでログを
+            # 残すだけで処理を継続しており、モデルファイルが存在するにもかかわらず
+            # 読み込みに失敗した場合(特徴量の次元数が変わった・ファイルが壊れている
+            # 等)、start_epochは0のままフルスクラッチの新規モデルとして静かに学習が
+            # 始まっていた。継続学習のつもりが実は最初からやり直しになっていた、
+            # という事故に気づきにくいため、ここは握りつぶさずに停止する。
+            # 本当に新規学習したい場合は、既存のmodel_{mode}.pthを退避/削除してから
+            # 実行すること。
+            logging.error(f"❌ 既存モデルの読み込みに失敗しました。学習を中止します: {e}", exc_info=True)
+            sys.exit(1)
     else:
         logging.info(f"model_{args.mode} not found")
         logging.info("create new model")
@@ -700,7 +746,21 @@ def main():
         train_class_loss = 0
         train_risk_loss = 0
         for batch_idx, batch_data in enumerate(tqdm(train_loader,desc = f"Epoch {epoch+1}")):
-            if batch_data is None:
+            # 💡 修正(2026-11-13の調査で判明した問題への対応): model.fusionの
+            # nn.BatchNorm1d(256)は、model.train()中にバッチサイズ1だと
+            # 「Expected more than 1 value per channel」で例外になる。
+            # DataLoaderはdrop_lastを指定していないため最後のバッチが半端になり得る上、
+            # safe_collate_fnが画像読み込み失敗サンプルを除外する(Driveリトライを
+            # 使い切った場合に発生し得る)ことでも、バッチが1件だけになる可能性がある。
+            # Noneチェックだけでは拾えない(Noneはバッチ全件が失敗した場合のみ)ため、
+            # サイズそのものを確認する。検証(eval)時はBatchNormが実行時統計を使わず
+            # 既存の移動平均を使うためこの制約は無く、ここは学習ループのみの対応でよい。
+            if batch_data is None or len(batch_data[0]) < 2:
+                if batch_data is not None:
+                    logging.warning(
+                        f"⚠️ バッチサイズが{len(batch_data[0])}件のため、このバッチをスキップします"
+                        f"(BatchNorm1dの制約により学習時はバッチサイズ2以上が必要)"
+                    )
                 continue
             imgs,tabs,cls,risks,symbol_ids = batch_data
             imgs, tabs, symbol_ids = imgs.to(device), tabs.to(device), symbol_ids.to(device)

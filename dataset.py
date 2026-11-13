@@ -10,6 +10,16 @@ import logging
 
 from model import SYMBOL_TO_ID
 
+# 💡 修正(2026-11-13の調査で判明した問題への対応): train.pyが
+# `input_dim = first_train_df.shape[1] - 5` という固定値で表形式特徴量の次元数を
+# 算出しており、この「5」は本来ここ(EXCLUDE_COLSの件数)と連動しているはずの
+# 暗黙の前提だった。ラベル生成側の列数が変わった場合に連動して直すのを忘れると、
+# 気づきにくい形でモデルの入力次元がズレる。インスタンス属性ではなくモジュール
+# レベルの定数として公開し、train.py側がlen(EXCLUDE_COLS)を直接参照できるように
+# することで、「5」という決め打ちの値そのものを無くす。
+EXCLUDE_COLS = ["time", "future_close", "price_diff_pct", "target_class", "target_risk_pct"]
+
+
 def setup_logger():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -59,7 +69,7 @@ class FXMultimodalDataset(Dataset):
                 f"👉 先に `generate_images.py` を実行してMTF画像を生成してください。"
                 )
         
-        self.exclude_cols = ["time", "future_close", "price_diff_pct", "target_class", "target_risk_pct"]
+        self.exclude_cols = EXCLUDE_COLS
         self.features_cols = [col for col in self.data.columns if col not in self.exclude_cols]
 
         self.data[self.features_cols] = self.data[self.features_cols].ffill().bfill().fillna(1)
