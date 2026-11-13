@@ -1,6 +1,4 @@
 import os
-import errno
-import time
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -23,26 +21,16 @@ EXCLUDE_COLS = ["time", "future_close", "price_diff_pct", "target_class", "targe
 def setup_logger():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# 💡 追加(2026-11-07の改修): train.py経由でのDataLoader(num_workers>0)が、Google
-# Drive(FUSEマウント)上の画像を読む際に一時的な接続切断(OSError: [Errno 107]
-# Transport endpoint is not connected / [Errno 5] Input/output error)に遭遇する
-# ことがある。強化学習側のportfolio_dataset.py(_open_image_with_retry)と同じ
-# 考え方・同じ定数でリトリイする。
-IMAGE_READ_MAX_RETRIES = 2
-IMAGE_READ_RETRY_BACKOFF_BASE = 2  # 秒(2, 4秒)
-
-
-def _open_image_with_retry(img_path):
-    last_err = None
-    for attempt in range(IMAGE_READ_MAX_RETRIES):
-        try:
-            return Image.open(img_path).convert("RGB")
-        except OSError as e:
-            if e.errno not in (errno.ENOTCONN, errno.EIO):
-                raise
-            last_err = e
-            time.sleep(IMAGE_READ_RETRY_BACKOFF_BASE * (2 ** attempt))
-    raise last_err
+# 💡 修正(2026-11-13の調査で判明した問題への対応): 以前はここで
+# Google Drive(FUSEマウント)の一時的な接続切断(OSError: [Errno 107] Transport
+# endpoint is not connected / [Errno 5] Input/output error)に対し、2秒→4秒の
+# 間隔でリトリイしていた。しかし実機でDrive接続が広範囲に不安定になった際、
+# リトリイの明示的な待ち時間より、読み込み自体が失敗と判定されるまでの時間
+# (FUSE側の内部タイムアウト)が支配的で、リトリイするたびにこの長い待ちを
+# 重ねてしまい、1エポックが大幅に遅延する事態になった。この読み込みは
+# __getitem__のexceptで失敗時にそのサンプルを1エポックぶんスキップするだけ
+# (検証台帳のように恒久的な判定として残るわけではなく、次エポックでまた
+# 読み直しの機会がある)なので、粘らず即座に諦める方が実害が小さい。
 
 class FXMultimodalDataset(Dataset):
 
@@ -133,7 +121,7 @@ class FXMultimodalDataset(Dataset):
         img_path = os.path.join(self.img_dir, f"{time_str}.png")
         
         try:
-            image = _open_image_with_retry(img_path)
+            image = Image.open(img_path).convert("RGB")
             if self.transform:
                 image_tensor = self.transform(image)
 

@@ -383,9 +383,8 @@ class ScaledFXDataset(torch.utils.data.Dataset):
         # 画像読み込み失敗時に意図的にNoneを返す設計(safe_collate_fnがバッチから
         # 除外する前提)だが、ここで無条件にアンパックしていたため、None が返った
         # 瞬間に「cannot unpack non-iterable NoneType object」でクラッシュしていた
-        # (Drive再接続直後の不安定な時間帯に、_open_image_with_retryがリトリイを
-        # 使い切った場合に発生)。Noneはそのまま伝播させ、safe_collate_fn側で
-        # 正しく除外されるようにする。
+        # (Drive接続が不安定な時間帯の画像読み込み失敗時に発生)。Noneはそのまま
+        # 伝播させ、safe_collate_fn側で正しく除外されるようにする。
         sample = self.dataset[idx]
         if sample is None:
             return None
@@ -398,7 +397,7 @@ class ScaledFXDataset(torch.utils.data.Dataset):
 
 def main():
     log_file = setup_logger()
-    logging.info(f"train.py ver2.3 (log: {log_file})")
+    logging.info(f"train.py ver2.4 (log: {log_file})")
     parser = argparse.ArgumentParser(description="FX Multiple training with date range")
     parser.add_argument("--mode", type=str, default="medium", choices=["short", "medium", "long"])
     parser.add_argument("--epochs", type=int, default=50)
