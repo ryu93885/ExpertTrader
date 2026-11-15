@@ -8,6 +8,7 @@ import logging
 import argparse
 import json
 import shutil
+from datetime import datetime
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix, mean_absolute_error, accuracy_score
 from torch.utils.data._utils.collate import default_collate
@@ -18,6 +19,64 @@ from dataset import FXMultimodalDataset
 
 def setup_logger():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+# 💡 追加(2026-11-15の改修): 過去の評価結果(今回のような新データ追加+継続学習の
+# 前後比較等)を記録しておく場所がなく、「以前の結果と比べてどうか」を確認できない
+# 問題があった。評価のたびに要点(全体・銘柄別の精度、クラス別precision/recall/f1)
+# のみをCSVに1行追記し、以降は簡単に比較できるようにする。train.pyのEXPECTED_SYMBOLS
+# と同じ並びを使い、列構成を安定させる(評価されなかった銘柄は空欄になる)。
+EXPECTED_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
+EVAL_HISTORY_DIR = "evaluation_history"
+DRIVE_FOLDER_NAME = "FX_AI_Models"
+
+
+def _get_eval_history_paths(mode):
+    os.makedirs(EVAL_HISTORY_DIR, exist_ok=True)
+    filename = f"evaluation_history_{mode}.csv"
+    local_path = os.path.join(EVAL_HISTORY_DIR, filename)
+    drive_path = f"/content/drive/MyDrive/{DRIVE_FOLDER_NAME}/{filename}"
+    return local_path, drive_path
+
+
+def record_evaluation_history(mode, selected_model, overall_acc, overall_mae, class_report, per_symbol_metrics):
+    """
+    評価結果の要点のみを履歴CSVに1行追記する(詳細な分類レポート・混同行列は
+    対象外。前回との比較に必要な数値とサマリーのみ)。
+    """
+    local_path, drive_path = _get_eval_history_paths(mode)
+
+    if not os.path.exists(local_path) and os.path.exists(drive_path):
+        shutil.copy(drive_path, local_path)
+        logging.info(f"📥 Driveから評価履歴を復元しました: {drive_path}")
+
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": mode,
+        "selected_model": selected_model,
+        "overall_accuracy": overall_acc,
+        "overall_risk_mae": overall_mae,
+    }
+    for label, key in [("sell", "-1"), ("hold", "0"), ("buy", "1")]:
+        stats = class_report.get(key, {})
+        row[f"{label}_precision"] = stats.get("precision")
+        row[f"{label}_recall"] = stats.get("recall")
+        row[f"{label}_f1"] = stats.get("f1-score")
+
+    for symbol in EXPECTED_SYMBOLS:
+        m = per_symbol_metrics.get(symbol)
+        row[f"{symbol}_accuracy"] = m[0] if m else None
+        row[f"{symbol}_risk_mae"] = m[1] if m else None
+
+    df_row = pd.DataFrame([row])
+    write_header = not os.path.exists(local_path)
+    df_row.to_csv(local_path, mode="a", header=write_header, index=False)
+    logging.info(f"📝 評価履歴を記録しました: {local_path}")
+
+    if os.path.exists("/content/drive/MyDrive"):
+        drive_dir = os.path.dirname(drive_path)
+        os.makedirs(drive_dir, exist_ok=True)
+        shutil.copy(local_path, drive_path)
+        logging.info(f"☁️ 評価履歴をDriveに保存しました: {drive_path}")
 
 # ==========================================
 # 🌟 破損・欠損データをバッチから安全に除外するフィルター
@@ -118,7 +177,7 @@ def print_symbol_report(pair_name, cls_true, cls_pred, risk_true, risk_pred):
     n = len(cls_true)
     if n == 0:
         logging.warning(f"  [{pair_name}] 評価可能なサンプルが0件のためスキップします。")
-        return
+        return None, None
 
     acc = accuracy_score(cls_true, cls_pred)
     mae = mean_absolute_error(risk_true, risk_pred) if len(risk_true) > 0 else float("nan")
@@ -171,6 +230,8 @@ def print_symbol_report(pair_name, cls_true, cls_pred, risk_true, risk_pred):
         print(f"  True: {true_label:<4}  {row_str}")
 
     print(classification_report(cls_true, cls_pred, labels=[-1, 0, 1], target_names=target_names, zero_division=0))
+
+    return acc, mae
 
 
 def main():
@@ -361,9 +422,14 @@ def main():
     logging.info(" 銘柄別 詳細レポート")
     logging.info("=" * 60)
 
+    per_symbol_metrics = {}
     for pair_name in sorted(final_per_symbol.keys()):
         d = final_per_symbol[pair_name]
-        print_symbol_report(pair_name, d["cls_true"], d["cls_pred"], d["risk_true"], d["risk_pred"])
+        sym_acc, sym_mae = print_symbol_report(pair_name, d["cls_true"], d["cls_pred"], d["risk_true"], d["risk_pred"])
+        per_symbol_metrics[pair_name] = (sym_acc, sym_mae)
+
+    class_report_dict = classification_report(t_cls, p_cls, labels=[-1, 0, 1], output_dict=True, zero_division=0)
+    record_evaluation_history(args.mode, best_variant_name, best_overall_acc, overall_mae, class_report_dict, per_symbol_metrics)
 
 
 if __name__ == "__main__":
