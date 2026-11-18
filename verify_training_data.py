@@ -10,15 +10,47 @@ train.pyを実行する前に、labeled_data/*_{mode}_scaled.csvと画像フォ�
   python verify_training_data.py --mode medium --exclude-symbols GOLD
 """
 import argparse
+import errno
 import logging
 import os
 import sys
+import time
 
 import pandas as pd
 
 from dataset import EXCLUDE_COLS, HOLD_RETENTION_PERCENTILE, compute_dynamic_window, compute_next_action_idx
 
 EXPECTED_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
+
+# 💡 追加(2026-11-18の改修): train.py等と同じ考え方で、Google Drive(FUSEマウント)
+# への一時的な接続切断(OSError: [Errno 107] Transport endpoint is not connected /
+# [Errno 5] Input/output error)に対してリトリイする。このスクリプト自体でも
+# 実機でタイムアウトが発生したため追加した。それ以外のエラー(ファイルが本当に
+# 存在しない場合のFileNotFoundError等)は即座に呼び出し元に伝える。
+DRIVE_IO_MAX_RETRIES = 5
+DRIVE_IO_RETRY_BACKOFF_BASE = 10  # 秒。リトリイ毎に倍増(10, 20, 40, 80, 160秒)
+
+
+def _with_drive_retry(func, *args, **kwargs):
+    last_err = None
+    for attempt in range(DRIVE_IO_MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except OSError as e:
+            if e.errno not in (errno.ENOTCONN, errno.EIO):
+                raise
+            last_err = e
+            wait = DRIVE_IO_RETRY_BACKOFF_BASE * (2 ** attempt)
+            logging.warning(
+                f"⚠️ Google Driveへの接続が一時的に切断されたようです: {e}"
+                f" -- {wait}秒後に再試行します({attempt + 1}/{DRIVE_IO_MAX_RETRIES})"
+            )
+            time.sleep(wait)
+    raise last_err
+
+
+def _scan_dir_png_count(img_dir):
+    return sum(1 for e in os.scandir(img_dir) if e.name.endswith(".png"))
 
 
 def setup_logger():
@@ -34,23 +66,24 @@ def check_symbol(symbol, mode):
     csv_path = f"labeled_data/{symbol}_{mode}_scaled.csv"
     img_dir = f"images/{symbol}/{mode}_MTF"
 
-    if not os.path.exists(csv_path):
+    try:
+        df = _with_drive_retry(pd.read_csv, csv_path)
+    except FileNotFoundError:
         errors.append(f"❌ [{symbol}] CSVが見つかりません: {csv_path}")
         return errors, None
 
-    df = pd.read_csv(csv_path)
     if "time" not in df.columns or "target_class" not in df.columns:
         errors.append(f"❌ [{symbol}] 想定している列(time・target_class)が見つかりません: {csv_path}")
         return errors, None
     df["time"] = pd.to_datetime(df["time"])
 
-    if not os.path.isdir(img_dir):
-        errors.append(f"❌ [{symbol}] 画像ディレクトリが見つかりません: {img_dir}")
-        n_images = 0
-    else:
-        n_images = sum(1 for e in os.scandir(img_dir) if e.name.endswith(".png"))
+    try:
+        n_images = _with_drive_retry(_scan_dir_png_count, img_dir)
         if n_images == 0:
             errors.append(f"❌ [{symbol}] 画像ディレクトリに画像が1件もありません: {img_dir}")
+    except FileNotFoundError:
+        errors.append(f"❌ [{symbol}] 画像ディレクトリが見つかりません: {img_dir}")
+        n_images = 0
 
     target_classes = df["target_class"].values
     next_action_idx = compute_next_action_idx(target_classes)
