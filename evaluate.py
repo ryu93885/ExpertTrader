@@ -14,7 +14,7 @@ from sklearn.metrics import classification_report, confusion_matrix, mean_absolu
 from torch.utils.data._utils.collate import default_collate
 
 import torch.nn.functional as F
-from model import MultimodalFXmodel
+from model import MultimodalFXmodel, SYMBOL_TO_ID, NUM_SYMBOLS
 from dataset import FXMultimodalDataset
 
 def setup_logger():
@@ -102,6 +102,22 @@ def get_checkpoint_input_dim(checkpoint):
         state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         weight = state_dict.get("gru.weight_ih_l0")
         return int(weight.shape[1]) if weight is not None else None
+    except Exception:
+        return None
+
+
+def get_checkpoint_num_symbols(checkpoint):
+    """
+    💡 追加(2026-11-18の改修): --exclude-symbols(train.py)で一部銘柄を除いて
+    学習したチェックポイントは、銘柄埋め込み層(symbol_embedding.weight)の行数が
+    全銘柄数(NUM_SYMBOLS)より少ない。get_checkpoint_input_dimと同じ考え方で、
+    モデル本体(埋め込み層の形状)から直接読み取る。読み取れない場合はNoneを返し、
+    呼び出し元が全銘柄想定(NUM_SYMBOLS)にフォールバックする。
+    """
+    try:
+        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        weight = state_dict.get("symbol_embedding.weight")
+        return int(weight.shape[0]) if weight is not None else None
     except Exception:
         return None
 
@@ -337,7 +353,18 @@ def main():
             logging.warning(f"⚠️ {path} からモデルの入力次元数を読み取れませんでした。スキップします。")
             continue
 
-        model = MultimodalFXmodel(num_tabular_features=expected_dim).to(device)
+        # 💡 追加(2026-11-18の改修): --exclude-symbols(train.py)で一部銘柄を除いて
+        # 学習したチェックポイントかどうかを、銘柄埋め込み層の行数から確認する。
+        expected_num_symbols = get_checkpoint_num_symbols(checkpoint)
+        if expected_num_symbols is None:
+            expected_num_symbols = NUM_SYMBOLS
+        elif expected_num_symbols < NUM_SYMBOLS:
+            logging.info(
+                f"ℹ️ {path} は{expected_num_symbols}銘柄分の埋め込みのみ持つモデルのようです"
+                f"(除外された銘柄はこの変種の評価対象から外します)"
+            )
+
+        model = MultimodalFXmodel(num_tabular_features=expected_dim, num_symbols=expected_num_symbols).to(device)
         state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         try:
             model.load_state_dict(state_dict)
@@ -347,8 +374,13 @@ def main():
 
         # 🌟 各銘柄のテストCSVの特徴量数が、このモデルの入力次元と一致するかを事前チェック。
         #    一致しない銘柄は「古いtest_data/キャッシュ」等の疑いがあるため、この変種の評価から除外する。
+        # 💡 追加(2026-11-18): 銘柄埋め込みの範囲外になる銘柄(除外学習された銘柄)も、
+        #    埋め込み参照でエラーになる前にここで除外する。
         usable_loaders = []
         for loader, pair_name, n_features in test_loaders:
+            if SYMBOL_TO_ID.get(pair_name, -1) >= expected_num_symbols:
+                logging.info(f"ℹ️ [{pair_name}] はこのモデルの学習時に除外されていたため、評価対象から外します。")
+                continue
             if n_features != expected_dim:
                 logging.warning(
                     f"⚠️ [{pair_name}] のテストデータ特徴量数({n_features})がモデルの入力次元({expected_dim})と不一致。"

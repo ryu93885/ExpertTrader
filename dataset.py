@@ -34,7 +34,7 @@ def setup_logger():
 
 class FXMultimodalDataset(Dataset):
 
-    def __init__(self, csv_file, img_dir, symbol, transform=None, seq_length=40):
+    def __init__(self, csv_file, img_dir, symbol, transform=None, seq_length=40, symbol_to_id=None):
         """
         Custom dataset for multimodal AI (Time-Series Safe & Missing Data Tolerant Version)
 
@@ -42,6 +42,9 @@ class FXMultimodalDataset(Dataset):
             symbol (str): このデータセットが対象とする銘柄名(例: "USDJPY")。
                 model.SYMBOL_TO_ID を通じて銘柄埋め込み用のIDに変換される。
                 学習側・ライブ側で対応がズレないよう、必ずこの唯一の対応表を使う。
+            symbol_to_id (dict, optional): 省略時はmodel.SYMBOL_TO_ID(全7銘柄)を
+                使う。特定の銘柄を除いて学習・評価する場合(model.get_active_symbol_map
+                参照)は、呼び出し元がここに絞り込んだ対応表を渡す。
         """
         # 1. データの読み込み（⚠️ 行は絶対に削除しない。時系列の連続性を保つため）
         self.data = pd.read_csv(csv_file)
@@ -49,7 +52,7 @@ class FXMultimodalDataset(Dataset):
         self.img_dir = img_dir
         self.seq_length = seq_length
         self.symbol = symbol
-        self.symbol_id = SYMBOL_TO_ID[symbol]
+        self.symbol_id = (symbol_to_id or SYMBOL_TO_ID)[symbol]
 
         if not os.path.exists(img_dir):
             raise FileNotFoundError(

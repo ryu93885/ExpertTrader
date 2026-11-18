@@ -55,6 +55,27 @@ SYMBOL_TO_ID = {sym: i for i, sym in enumerate(SYMBOL_LIST)}
 NUM_SYMBOLS = len(SYMBOL_LIST)
 
 
+def get_active_symbol_map(exclude_symbols=None):
+    """
+    💡 追加(2026-11-18の改修): 特定の銘柄(例: GOLD)を除いて学習・評価する
+    検証(再学習そのものは必要だが、どの銘柄を使うかを簡単に切り替えられるように
+    する)のための対応表。exclude_symbolsに含めた銘柄をSYMBOL_LISTから除いた上で、
+    残りの銘柄のIDを0から振り直す。
+
+    ⚠️ SYMBOL_LISTの末尾からの除外のみ安全(残りの銘柄のIDが元のSYMBOL_TO_IDと
+    完全に一致するため、既存チェックポイントの銘柄埋め込み層の該当行を単純に
+    取り除くだけで引き継げる)。GOLDは現在SYMBOL_LISTの末尾なので対象にできるが、
+    途中の銘柄を除く場合はこの前提が崩れる(残りの銘柄のIDがズレる)ため、
+    migrate_symbol_embedding.pyでの引き継ぎはできず、ゼロからの再学習が必要になる。
+
+    戻り値: (symbol_to_id, num_symbols)
+    """
+    exclude_symbols = set(exclude_symbols or [])
+    active_symbols = [s for s in SYMBOL_LIST if s not in exclude_symbols]
+    symbol_to_id = {sym: i for i, sym in enumerate(active_symbols)}
+    return symbol_to_id, len(active_symbols)
+
+
 class MultimodalFXmodel(nn.Module):
 
     def __init__(self,num_tabular_features = 32,num_classes = 3,num_symbols = NUM_SYMBOLS,symbol_embed_dim = 8,

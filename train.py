@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from torch.utils.data._utils.collate import default_collate
 
 from collections import Counter
-from model import MultimodalFXmodel, RESNET_FREEZE_PRESETS
+from model import MultimodalFXmodel, RESNET_FREEZE_PRESETS, get_active_symbol_map
 from dataset import FXMultimodalDataset, EXCLUDE_COLS
 
 
@@ -397,7 +397,7 @@ class ScaledFXDataset(torch.utils.data.Dataset):
 
 def main():
     log_file = setup_logger()
-    logging.info(f"train.py ver2.4 (log: {log_file})")
+    logging.info(f"train.py ver2.5 (log: {log_file})")
     parser = argparse.ArgumentParser(description="FX Multiple training with date range")
     parser.add_argument("--mode", type=str, default="medium", choices=["short", "medium", "long"])
     parser.add_argument("--epochs", type=int, default=50)
@@ -411,7 +411,21 @@ def main():
     parser.add_argument("--freeze-backbone", type=str, default="none",
                          choices=list(RESNET_FREEZE_PRESETS.keys()),
                          help="ResNet50バックボーンの凍結範囲。noneなら従来通り全層をfine-tuning")
+    # 💡 追加(2026-11-18の改修): 特定の銘柄(例: GOLD)を学習データ・銘柄埋め込みの
+    # 両方から完全に除いて学習する検証用オプション。「その銘柄を含めることが他の
+    # 銘柄の学習に悪影響/好影響を与えていないか」を確認する目的。SYMBOL_LISTの
+    # 末尾の銘柄のみ安全に除外できる(詳細はmodel.get_active_symbol_map参照)。
+    # 既存チェックポイントから引き継ぐ場合はmigrate_symbol_embedding.pyで
+    # 先に銘柄埋め込み層を変換しておくこと。
+    parser.add_argument("--exclude-symbols", type=str, default="",
+                         help="学習から完全に除外する銘柄をコンマ区切りで指定(例: GOLD)。"
+                              "省略時は全銘柄を使う従来通りの挙動")
     args = parser.parse_args()
+
+    exclude_symbols = {s.strip() for s in args.exclude_symbols.split(",") if s.strip()}
+    symbol_to_id, active_num_symbols = get_active_symbol_map(exclude_symbols)
+    if exclude_symbols:
+        logging.info(f"🚫 以下の銘柄を学習から除外します: {sorted(exclude_symbols)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
@@ -440,7 +454,8 @@ def main():
     # 見つかれば(7銘柄中いくつ欠けていても)無言で学習を続行してしまっていた。
     # ポートフォリオ側(precompute_portfolio.py等)と同じ7銘柄を期待値として明示し、
     # 欠けている銘柄があればここで気づけるようにする。
-    EXPECTED_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
+    EXPECTED_SYMBOLS = [s for s in ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
+                        if s not in exclude_symbols]
     found_symbols = sorted({os.path.basename(p).split("_")[0] for p in csv_files})
     missing_symbols = [s for s in EXPECTED_SYMBOLS if s not in found_symbols]
     if missing_symbols:
@@ -472,6 +487,9 @@ def main():
 
     for csv_path in csv_files:
         symbol = os.path.basename(csv_path).split("_")[0]
+        if symbol in exclude_symbols:
+            logging.info(f"🚫 [{symbol}] --exclude-symbolsで指定されたため、このデータは使用しません")
+            continue
         test_csv_path = f"test_data/{symbol}_{args.mode}_test.csv"
         tmp_train_csv = f"temp_train_{symbol}_{args.mode}.csv"
         tmp_val_csv = f"temp_val_{symbol}_{args.mode}.csv"
@@ -570,8 +588,8 @@ def main():
         current_img_dir = os.path.join("images",symbol,f"{args.mode}_MTF")
         try:
             
-            raw_tr_ds = FXMultimodalDataset(tmp_train_csv, current_img_dir, symbol=symbol, seq_length=SEQ_LENGTH)
-            raw_val_ds = FXMultimodalDataset(tmp_val_csv, current_img_dir, symbol=symbol, seq_length=SEQ_LENGTH)
+            raw_tr_ds = FXMultimodalDataset(tmp_train_csv, current_img_dir, symbol=symbol, seq_length=SEQ_LENGTH, symbol_to_id=symbol_to_id)
+            raw_val_ds = FXMultimodalDataset(tmp_val_csv, current_img_dir, symbol=symbol, seq_length=SEQ_LENGTH, symbol_to_id=symbol_to_id)
 
             if len(raw_tr_ds) > 0:
                 train_datasets.append(ScaledFXDataset(raw_tr_ds, risk_mean, risk_std))
@@ -628,7 +646,7 @@ def main():
     # ではなく、dataset.pyのEXCLUDE_COLS(特徴量から除外する列)の件数を直接参照する。
     # ラベル生成側の列数が将来変わっても、ここが自動的に追従する。
     input_dim = first_train_df.shape[1] - len(EXCLUDE_COLS)
-    model = MultimodalFXmodel(num_tabular_features=input_dim, freeze_backbone=args.freeze_backbone).to(device)
+    model = MultimodalFXmodel(num_tabular_features=input_dim, num_symbols=active_num_symbols, freeze_backbone=args.freeze_backbone).to(device)
     if model.frozen_backbone_param_count > 0:
         logging.info(
             f"🧊 ResNet50バックボーンを一部凍結しました(--freeze-backbone={args.freeze_backbone}, "

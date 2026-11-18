@@ -14,7 +14,10 @@ from stable_baselines3.common.vec_env import DummyVecEnv,VecNormalize
 from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv, RISK_PER_TRADE_PCT_DEFAULT
 from rl_checkpoint_utils import resolve_model_paths
-from backtest_metrics import compute_performance_summary, log_performance_summary, run_backtest_episode
+from backtest_metrics import (
+    compute_performance_summary, log_performance_summary, run_backtest_episode,
+    analyze_symbol_contribution, log_symbol_contribution_analysis,
+)
 
 DRIVE_TEST_RESULTS_DIR = "/content/drive/MyDrive/FX_AI_Models/test_results"
 LOCAL_TEST_RESULTS_DIR = "test_results"
@@ -174,7 +177,7 @@ def main():
     log_file_path = os.path.join(results_dir, f"test_portfolio_{args.mode}_{timestamp}.log")
     setup_logger(log_file_path)
 
-    logging.info("test_portfolio.py ver214.0")
+    logging.info("test_portfolio.py ver215.0")
     if results_dir == DRIVE_TEST_RESULTS_DIR:
         logging.info(f"Google Driveを検出。テスト結果の保存先をDriveに設定します: {results_dir}")
     else:
@@ -332,6 +335,12 @@ def main():
     summary = compute_performance_summary(equities, balances, trades, initial_balance, elapsed_days)
     log_performance_summary(summary)
 
+    # 💡 追加(2026-11-18の改修): GOLDのような低エッジの銘柄が、ポートフォリオ全体の
+    # リスク低減(分散効果)に寄与していないかを、再学習なしで確認できるようにする。
+    if step_count > 0:
+        contribution_analysis = analyze_symbol_contribution(equities, trades, args.symbols)
+        log_symbol_contribution_analysis(contribution_analysis)
+
     # 💡 追加(2026-11-06): 資産推移を後から可視化・分析できるよう、ステップごとの
     # 生データ(時刻・Equity・Balance)もCSVに保存する(下のPNGグラフは静止画のみで、
     # 後から詳しく見返したり自分でグラフを作り直したりすることができないため)。
@@ -347,6 +356,13 @@ def main():
         })
         equity_df.to_csv(equity_curve_path, index=False)
         logging.info(f"📈 資産推移の生データをCSVにも保存しました: {equity_curve_path}")
+
+        # 💡 追加(2026-11-18の改修): 決済ごとの銘柄・損益の生データも保存する。
+        # これまでログの集計値のみで、後から銘柄間の相関等を再分析できなかったため。
+        if trades:
+            trades_path = os.path.join(results_dir, f"portfolio_trades_{args.mode}_{timestamp}.csv")
+            pd.DataFrame(trades).to_csv(trades_path, index=False)
+            logging.info(f"📈 決済ごとの生データ(銘柄・損益)もCSVに保存しました: {trades_path}")
 
     #結果の評価と可視化
     try:

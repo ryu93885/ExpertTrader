@@ -1,12 +1,24 @@
 import logging
 from collections import defaultdict
 
+import numpy as np
+
 # 💡 test_portfolio.py に実装した性能集計ロジックを、sweep_entry_threshold.py
 # (動的エントリー閾値のパラメータ探索)でも再利用するために共通化したモジュール。
 # portfolio_env.py の step() が返す info["realized_pnl_by_symbol"] は決済が
 # 発生したステップのみ非ゼロになるため、これを「決済1件=1トレード」として
 # 集計すれば、勝率・プロフィットファクターなどが算出できる(portfolio_env.py
 # 自体や学習ロジックには依存しない)。
+
+
+def _max_drawdown_pct(equities):
+    peak = -float("inf")
+    max_dd = 0.0
+    for eq in equities:
+        peak = max(peak, eq)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - eq) / peak * 100.0)
+    return max_dd
 
 
 def compute_performance_summary(equities, balances, trades, initial_balance, elapsed_days=None):
@@ -22,12 +34,7 @@ def compute_performance_summary(equities, balances, trades, initial_balance, ela
     final_balance = balances[-1] if balances else initial_balance
     total_return_pct = (final_equity - initial_balance) / initial_balance * 100.0
 
-    peak = -float("inf")
-    max_drawdown_pct = 0.0
-    for eq in equities:
-        peak = max(peak, eq)
-        if peak > 0:
-            max_drawdown_pct = max(max_drawdown_pct, (peak - eq) / peak * 100.0)
+    max_drawdown_pct = _max_drawdown_pct(equities)
 
     total_trades = len(trades)
     wins = [t for t in trades if t["pnl"] > 0]
@@ -106,6 +113,108 @@ def log_performance_summary(summary, log=logging):
             log.info(
                 f"    [{sym}] 件数={len(pnls)} 勝率={sym_win_rate:.1f}% 実現損益合計={sum(pnls):,.0f}円"
             )
+    log.info("=" * 60)
+
+
+# 💡 追加(2026-11-18の改修): 「GOLDのような低エッジの銘柄が、ポートフォリオ全体の
+# リスク低減(分散効果)に寄与している可能性」を、再学習せずに既存のバックテスト結果
+# (equities・trades)だけから確認するための分析。他銘柄との相関、および各銘柄を
+# 除外した場合の仮想Equity曲線・最大ドローダウンを算出する。
+#
+# ⚠️ 限界: 「その銘柄の実現損益を差し引く」という近似であり、max_concurrent_positions
+# 等による「その銘柄が使っていた枠が他の取引に回っていたら」という玉数の再配分までは
+# 再現できない。あくまで一次近似の参考値であり、確定的な結論(特に「共有モデルの学習
+# 自体への影響」)にはならない。それを確定させるには、--exclude-symbolsを使った
+# 比較学習が必要(train.py参照)。
+def analyze_symbol_contribution(equities, trades, symbols):
+    """
+    equities: 各ステップのEquityのリスト
+    trades: [{"step":int, "symbol":str, "pnl":float}, ...] (決済のみ)
+    symbols: 分析対象の銘柄リスト(例: PortfolioFXEnvに渡したsymbols)
+
+    戻り値:
+      {
+        "correlations": {(sym_a, sym_b): 相関係数 or None, ...},
+        "what_if_excluding": {
+            symbol: {"max_drawdown_pct": ..., "final_equity": ..., "drawdown_delta_pct": ...}
+        },
+        "actual_max_drawdown_pct": ...,
+        "actual_final_equity": ...,
+      }
+    """
+    n = len(equities)
+
+    # 各銘柄の「実現損益の累積系列」をステップ単位で再構築する
+    # (決済が起きたステップでのみ増減し、それ以外は直前の値を保持する)
+    cumulative_by_symbol = {sym: [0.0] * n for sym in symbols}
+    for t in trades:
+        sym = t["symbol"]
+        if sym not in cumulative_by_symbol:
+            continue
+        step_idx = min(max(t["step"] - 1, 0), n - 1)  # trades の step は1始まり
+        cumulative_by_symbol[sym][step_idx] += t["pnl"]
+    for sym in symbols:
+        series = cumulative_by_symbol[sym]
+        running = 0.0
+        for i in range(n):
+            running += series[i]
+            series[i] = running
+
+    # 1ステップごとの実現損益の変化(リターン代わり)の相関係数
+    diffs_by_symbol = {}
+    for sym in symbols:
+        series = cumulative_by_symbol[sym]
+        diffs_by_symbol[sym] = np.diff(series) if len(series) > 1 else np.array([])
+
+    correlations = {}
+    for i, sym_a in enumerate(symbols):
+        for sym_b in symbols[i + 1:]:
+            da, db = diffs_by_symbol[sym_a], diffs_by_symbol[sym_b]
+            if len(da) < 2 or np.std(da) == 0 or np.std(db) == 0:
+                correlations[(sym_a, sym_b)] = None  # 分散0(無取引等)は相関を定義できない
+            else:
+                correlations[(sym_a, sym_b)] = float(np.corrcoef(da, db)[0, 1])
+
+    actual_max_dd = _max_drawdown_pct(equities)
+    what_if_excluding = {}
+    for sym in symbols:
+        excluded_equity = [equities[i] - cumulative_by_symbol[sym][i] for i in range(n)]
+        dd = _max_drawdown_pct(excluded_equity)
+        what_if_excluding[sym] = {
+            "max_drawdown_pct": dd,
+            "final_equity": excluded_equity[-1] if excluded_equity else None,
+            "drawdown_delta_pct": dd - actual_max_dd,  # 正なら「除外後の方が悪化する」=分散に寄与していた可能性
+        }
+
+    return {
+        "correlations": correlations,
+        "what_if_excluding": what_if_excluding,
+        "actual_max_drawdown_pct": actual_max_dd,
+        "actual_final_equity": equities[-1] if equities else None,
+    }
+
+
+def log_symbol_contribution_analysis(analysis, log=logging):
+    log.info("=" * 60)
+    log.info("🔗 銘柄間の相関・除外時の仮想シミュレーション(再学習なしの参考値)")
+    log.info("=" * 60)
+    log.info("--- 実現損益の変化の相関係数(1に近いほど同じ動き、0に近いほど無関係、負なら逆の動き) ---")
+    for (sym_a, sym_b), corr in sorted(analysis["correlations"].items()):
+        corr_str = f"{corr:+.2f}" if corr is not None else "算出不可(片方が無取引等)"
+        log.info(f"    {sym_a} - {sym_b}: {corr_str}")
+
+    log.info(
+        f"--- 各銘柄を除外した場合の仮想最大ドローダウン(実際: {analysis['actual_max_drawdown_pct']:.2f}%) ---"
+    )
+    log.info("    ⚠️ その銘柄の実現損益を差し引いた近似値。玉数上限による取引機会の再配分は考慮していません。")
+    for sym, info in sorted(analysis["what_if_excluding"].items()):
+        direction = "悪化(分散に寄与していた可能性)" if info["drawdown_delta_pct"] > 0.01 else (
+            "改善(リスクを増やしていた可能性)" if info["drawdown_delta_pct"] < -0.01 else "ほぼ変化なし"
+        )
+        log.info(
+            f"    [{sym}除外時] 最大ドローダウン={info['max_drawdown_pct']:.2f}% "
+            f"(差分 {info['drawdown_delta_pct']:+.2f}pt, {direction})"
+        )
     log.info("=" * 60)
 
 
