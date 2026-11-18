@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -16,6 +17,52 @@ from model import SYMBOL_TO_ID
 # レベルの定数として公開し、train.py側がlen(EXCLUDE_COLS)を直接参照できるように
 # することで、「5」という決め打ちの値そのものを無くす。
 EXCLUDE_COLS = ["time", "future_close", "price_diff_pct", "target_class", "target_risk_pct"]
+
+# 💡 追加(2026-11-18の調査で判明した問題への対応): 「HOLD行は直近何本以内に
+# 売買シグナルがあれば学習対象に残す」という窓が16本の固定値だったため、銘柄に
+# よって売買シグナルの時間的な密度が異なる(例: GOLDはシグナルが偏って発生し、
+# 間隔が広い)場合、同じ16本という基準では銘柄ごとに実質的な意味が変わって
+# しまっていた(GOLDだけHOLD行の採用率が他銘柄の6〜7割程度まで下がり、有効
+# サンプル数が大きく減っていた)。create_labels.pyが分類閾値を銘柄自身の標準
+# 偏差で自動調整しているのと同じ考え方で、固定の本数ではなく、その銘柄自身の
+# HOLD行の「次のシグナルまでの距離」の分布から動的に窓を算出する。
+# HOLD_RETENTION_PERCENTILEは「HOLD行の何%を学習対象として残すか」を決め、
+# 具体的な本数は銘柄ごとのデータから自動的に決まる。
+HOLD_RETENTION_PERCENTILE = 50
+
+
+def compute_next_action_idx(target_classes):
+    """
+    target_classes(target_class列のnumpy配列)から、各行について「直後に来る
+    売買シグナル(HOLD以外)のインデックス」を計算する(無ければ-1)。
+    FXMultimodalDataset.__init__と検証スクリプト(verify_training_data.py)の
+    両方で使う共通ロジック。
+    """
+    n = len(target_classes)
+    next_action_idx = [-1] * n
+    last_action = -1
+    for i in range(n - 1, -1, -1):
+        val = target_classes[i]
+        if not pd.isna(val) and val != 0:
+            last_action = i
+        next_action_idx[i] = last_action
+    return next_action_idx
+
+
+def compute_dynamic_window(target_classes, next_action_idx, percentile=HOLD_RETENTION_PERCENTILE):
+    """
+    HOLD_RETENTION_PERCENTILE参照。HOLD行の「次のシグナルまでの距離」の分布
+    から、銘柄ごとに動的な窓(本数)を算出する。戻り値: (window, HOLD行の件数)。
+    """
+    n = len(target_classes)
+    hold_gaps = [
+        next_action_idx[i] - i
+        for i in range(n)
+        if target_classes[i] == 0 and next_action_idx[i] != -1
+    ]
+    if hold_gaps:
+        return int(np.percentile(hold_gaps, percentile)), len(hold_gaps)
+    return 16, 0  # HOLD行に未来のシグナルが1件も無い(通常あり得ない)場合のフォールバック
 
 
 def setup_logger():
@@ -82,15 +129,15 @@ class FXMultimodalDataset(Dataset):
         self.valid_target_indices = []
         target_classes = self.data["target_class"].values # ilocを避けてnumpy配列で高速化
         n = len(self.data)
-        
+
         # 後ろから順に「最後に見たHold(1)以外のアクションのインデックス」を記録
-        next_action_idx = [-1] * n
-        last_action = -1
-        for i in range(n - 1, -1, -1):
-            val = target_classes[i]
-            if not pd.isna(val) and val != 0:
-                last_action = i
-            next_action_idx[i] = last_action
+        next_action_idx = compute_next_action_idx(target_classes)
+
+        self.dynamic_window, n_hold_gaps = compute_dynamic_window(target_classes, next_action_idx)
+        logging.info(
+            f"📏 [{symbol}] 動的ウィンドウ: HOLD行の{HOLD_RETENTION_PERCENTILE}パーセンタイル = "
+            f"{self.dynamic_window}本(HOLD行{n_hold_gaps}件から算出)"
+        )
 
         # 前から1回だけループして条件を判定
         for i in range(n):
@@ -98,9 +145,9 @@ class FXMultimodalDataset(Dataset):
                 continue
             if pd.isna(target_classes[i]):
                 continue
-            
+
             target_idx = next_action_idx[i]
-            if target_idx != -1 and (target_idx - i) <= 16:
+            if target_idx != -1 and (target_idx - i) <= self.dynamic_window:
                 self.valid_target_indices.append(i)
 
     def __len__(self):
