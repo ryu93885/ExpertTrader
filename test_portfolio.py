@@ -168,6 +168,10 @@ def main():
                          help="検証対象とする開始日時(例: 2026-08-27)。省略時はテストCSVの先頭から。"
                               "test CSVの末尾に新しい期間を追加した場合に、その新しい部分だけを"
                               "対象に検証するために使う")
+    # 💡 追加(2026-11-20): train.pyの--exclude-symbolsで学習したモデルをこのスクリプトでも
+    # 一貫して扱えるようにする(--symbolsを直接書き換える代わりに、末尾から除外する形で指定)。
+    parser.add_argument("--exclude-symbols", type=str, default="",
+                         help="バックテスト対象から除外する銘柄(カンマ区切り、--symbolsの末尾のみ指定可能)")
     args = parser.parse_args()
 
     # 💡 追加: ログファイル・グラフの保存先を先に決定してからロガーを初期化することで、
@@ -177,7 +181,7 @@ def main():
     log_file_path = os.path.join(results_dir, f"test_portfolio_{args.mode}_{timestamp}.log")
     setup_logger(log_file_path)
 
-    logging.info("test_portfolio.py ver215.0")
+    logging.info("test_portfolio.py ver216.0")
     if results_dir == DRIVE_TEST_RESULTS_DIR:
         logging.info(f"Google Driveを検出。テスト結果の保存先をDriveに設定します: {results_dir}")
     else:
@@ -214,6 +218,18 @@ def main():
             f"python precompute_portfolio.py --phase test --mode {args.mode} を実行してください"
         )
         return
+
+    exclude_symbols = {s.strip() for s in args.exclude_symbols.split(",") if s.strip()}
+    if exclude_symbols:
+        n = len(exclude_symbols)
+        if set(args.symbols[-n:]) != exclude_symbols:
+            logging.error(
+                f"❌ --exclude-symbolsは銘柄埋め込みIDの安全性のため、--symbolsの末尾のみ除外可能です"
+                f"(symbols={args.symbols}, 指定された除外={sorted(exclude_symbols)})"
+            )
+            return
+        logging.info(f"🚫 以下の銘柄はバックテスト対象から除外します: {sorted(exclude_symbols)}")
+        args.symbols = [s for s in args.symbols if s not in exclude_symbols]
 
     logging.info("テスト用データセットを読み込んでいます....")
     dataset = PortfolioFXDataset(merged_csv_path=test_csv,base_img_dir=img_dir,symbols = args.symbols,mode = args.mode)

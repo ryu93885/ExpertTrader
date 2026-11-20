@@ -20,6 +20,10 @@ logging.basicConfig(level=logging.INFO,format = "%(asctime)s [%(levelname)s] %(m
 # 💡 追加: merge_portfolio_data.py と同じDrive保存先(永続化用)。
 DRIVE_PORTFOLIO_DATA_DIR = "/content/drive/MyDrive/FX_AI_Models/portfolio_data"
 
+# 💡 追加(2026-11-20の検証で判明した問題への対応): evaluate.pyが選定した最新モデルは
+# このDrive直下のパスにのみ保存される(evaluate.py側のdrive_model_dir参照)。
+DRIVE_MODEL_DIR = "/content/drive/MyDrive/FX_AI_Models"
+
 # 💡 追加(2026-10-30の調査で判明した問題への対応): Google Drive(FUSEマウント)への
 # アデセスが集中すると、接続自体が切断されることがある(OSError: [Errno 107]
 # Transport endpoint is not connected / [Errno 5] Input/output error)。
@@ -50,6 +54,54 @@ def backup_to_drive(local_path):
         logging.info(f"☁️ Google Driveにバックアップしました: {dest}")
     except Exception as e:
         logging.error(f"⚠️ Google Driveへのバックアップに失敗しました ({local_path}): {e}")
+
+
+def sync_best_model_from_drive(mode):
+    """
+    💡 追加(2026-11-20の検証で判明した問題への対応): evaluate.pyが選定した最新モデルは
+    Google Drive側(DRIVE_MODEL_DIR/final_best_model_{mode}.pth)にのみ保存され、
+    本スクリプトが読むローカルパス(saved_model/final_best_model_{mode}.pth)への反映は
+    従来Notebook側の手動セル(shutil.copy)に依存していた。コピーを忘れた場合や、
+    同じColabランタイム内に以前の学習結果のローカルコピーが残っている場合、古いモデルが
+    無言で使われ続ける危険があった(run_colab_pipeline.py経由の自動実行には、そもそも
+    このコピー手順自体が存在しなかった)。ここで毎回Drive側の最新版を強制的にローカルへ
+    反映することで、「ローカルに既にあるから」という理由で古いファイルが使われることを防ぐ。
+    """
+    drive_path = os.path.join(DRIVE_MODEL_DIR, f"final_best_model_{mode}.pth")
+    local_path = f"saved_model/final_best_model_{mode}.pth"
+
+    if not os.path.exists(drive_path):
+        if os.path.exists(local_path):
+            logging.warning(
+                f"⚠️ Google Drive上に{drive_path}が見つからないため、ローカルの既存ファイルを"
+                f"そのまま使用します(evaluate.pyの最新の実行結果かどうかは保証されません): {local_path}"
+            )
+            return
+        logging.error(f"❌ モデルファイルがGoogle Drive・ローカルのどちらにも見つかりません: {drive_path}")
+        sys.exit(1)
+
+    os.makedirs("saved_model", exist_ok=True)
+    if os.path.exists(local_path) and os.path.getmtime(local_path) == os.path.getmtime(drive_path):
+        logging.info(f"✅ ローカルのモデルは既にGoogle Driveの最新版と同じです: {local_path}")
+        return
+
+    shutil.copy2(drive_path, local_path)
+    logging.info(f"☁️ Google Driveの最新モデルをローカルに反映しました: {drive_path} -> {local_path}")
+
+
+def get_checkpoint_num_symbols(checkpoint):
+    """
+    💡 追加(2026-11-20): evaluate.pyと同じロジック。チェックポイントの
+    symbol_embedding.weightの形状から、実際に学習時に使われていた銘柄数を読み取る。
+    --exclude-symbolsで学習されたモデル(埋め込み数が7未満)を、外部設定に頼らず
+    安全に扱えるようにするため。
+    """
+    try:
+        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        weight = state_dict.get("symbol_embedding.weight")
+        return int(weight.shape[0]) if weight is not None else None
+    except Exception:
+        return None
 
 
 def collate_fn_drop_none(batch):
@@ -229,7 +281,7 @@ def _delete_checkpoint(phase, mode):
 
 
 def main():
-    logging.info("precompute_portfolio.py ver214.0")
+    logging.info("precompute_portfolio.py ver215.0")
     # 💡 修正: 以前は "train" フェーズ専用に固定されており、test_portfolio.py が
     # 必要とする "portfolio_merged_data_test_with_preds.csv" を作る手段が存在しなかった。
     # (merge_portfolio_data.py は train/test 両方を出力するのに、precompute側が
@@ -250,9 +302,23 @@ def main():
     # 多いワーカー数を指定しても問題なく、並列化によって総時間を大きく短縮できる。
     parser.add_argument("--num-workers", type=int, default=16,
                          help="画像読み込みに使うDataLoaderのワーカー数(デフォルト16)")
+    parser.add_argument("--exclude-symbols", type=str, default="",
+                         help="推論対象から除外する銘柄(train.pyの--exclude-symbolsで学習したモデルを"
+                              "使う場合に指定する。カンマ区切り、末尾の銘柄のみ指定可能)")
     args = parser.parse_args()
 
     symbols = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
+    exclude_symbols = {s.strip() for s in args.exclude_symbols.split(",") if s.strip()}
+    if exclude_symbols:
+        n = len(exclude_symbols)
+        if set(symbols[-n:]) != exclude_symbols:
+            logging.error(
+                f"❌ --exclude-symbolsは銘柄埋め込みIDの安全性のため、末尾の銘柄のみ除外可能です"
+                f"(順序={symbols}, 指定された除外={sorted(exclude_symbols)})"
+            )
+            sys.exit(1)
+        logging.info(f"🚫 以下の銘柄は推論対象から除外します: {sorted(exclude_symbols)}")
+        symbols = [s for s in symbols if s not in exclude_symbols]
     mode = args.mode
     merged_csv = f"portfolio_merged_data_{args.phase}.csv"
     img_dir = "images"
@@ -294,11 +360,28 @@ def main():
         sys.exit(1)
 
     #2.loading model
+    # 💡 追加(2026-11-20): ローカルのモデルファイルがGoogle Drive上の最新(evaluate.pyの
+    # 最新選定結果)と一致しているかを確認・反映する(詳細はsync_best_model_from_drive参照)。
+    sync_best_model_from_drive(mode)
+
     input_dim = len(dataset.feature_cols[symbols[0]])
-    model = MultimodalFXmodel(num_tabular_features=input_dim).to(device)
     # 💡 修正(2026-10-30): モデル重みもDrive上のファイルであり、同じErrno 107/5の
     # リスクがあるため、_with_drive_retryで読み込む。
     checkpoint_model = _with_drive_retry(torch.load, model_path, map_location=device, weights_only=False)
+
+    # 💡 追加(2026-11-20): --exclude-symbolsで学習されたモデル(埋め込み数が7未満)を
+    # 安全に扱うため、チェックポイントの実際の埋め込み数を読み取り、このスクリプトが
+    # 推論しようとしている銘柄数と一致するか確認する(evaluate.pyと同じ考え方)。
+    expected_num_symbols = get_checkpoint_num_symbols(checkpoint_model) or len(symbols)
+    if expected_num_symbols != len(symbols):
+        logging.error(
+            f"❌ モデルの銘柄埋め込み数({expected_num_symbols})と、推論しようとしている銘柄数"
+            f"({len(symbols)})が一致しません。--exclude-symbolsの指定を確認してください"
+            f"(symbols={symbols})。"
+        )
+        sys.exit(1)
+
+    model = MultimodalFXmodel(num_tabular_features=input_dim, num_symbols=expected_num_symbols).to(device)
     model.load_state_dict(checkpoint_model["model_state_dict"])
     model.eval()
 

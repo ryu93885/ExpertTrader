@@ -47,12 +47,28 @@ RAW_FIELD_EXCLUDE = {"future_close", "price_diff_pct", "target_class", "target_r
 EXPECTED_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
 
 
-def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "portfolio_merged_data.csv",phase = "train"):
+def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "portfolio_merged_data.csv",phase = "train", exclude_symbols=None):
     setup_logger()
-    logging.info("merge_portfolio_data.py ver210.0")
+    logging.info("merge_portfolio_data.py ver211.0")
     output_file = f"portfolio_merged_data_{phase}.csv"
 
+    # 💡 追加(2026-11-20): train.py / precompute_portfolio.py 等と同様に、特定銘柄を
+    # 除外して統合できるようにする(--exclude-symbolsで学習したモデルをRL側でも
+    # 使う場合に対応)。埋め込みIDの安全性のため、EXPECTED_SYMBOLSの末尾からのみ除外可能。
+    exclude_symbols = set(exclude_symbols or [])
+    if exclude_symbols:
+        n = len(exclude_symbols)
+        if set(EXPECTED_SYMBOLS[-n:]) != exclude_symbols:
+            logging.error(
+                f"❌ --exclude-symbolsは銘柄埋め込みIDの安全性のため、EXPECTED_SYMBOLSの末尾からのみ"
+                f"除外可能です(EXPECTED_SYMBOLS={EXPECTED_SYMBOLS}, 指定された除外={sorted(exclude_symbols)})"
+            )
+            sys.exit(1)
+        logging.info(f"🚫 以下の銘柄は統合対象から除外します: {sorted(exclude_symbols)}")
+    target_symbols = [s for s in EXPECTED_SYMBOLS if s not in exclude_symbols]
+
     csv_paths = glob.glob(os.path.join(csv_dir,f"*_{mode}_scaled_{phase}.csv"))
+    csv_paths = [p for p in csv_paths if os.path.basename(p).split("_")[0] not in exclude_symbols]
 
     # 💡 修正(2026-10-30): 以前はここが return のみだったため終了コードが0(正常終了)に
     # なり、run_colab_pipeline.py の run_command() がこの中止を検出できず「✅ 完了」と
@@ -65,7 +81,7 @@ def merge_portfolio_data(csv_dir = "labeled_data",mode = "short",output_file = "
         sys.exit(1)
 
     found_symbols = sorted({os.path.basename(p).split("_")[0] for p in csv_paths})
-    missing_symbols = [s for s in EXPECTED_SYMBOLS if s not in found_symbols]
+    missing_symbols = [s for s in target_symbols if s not in found_symbols]
     if missing_symbols:
         logging.error(
             f"❌ 以下の銘柄のデータが見つからないため、統合処理を中止します: {missing_symbols}"
@@ -194,7 +210,11 @@ if __name__ == "__main__":
     # --mode を明示的に指定できるようにする。
     parser = argparse.ArgumentParser(description="ポートフォリオ用のデータ統合")
     parser.add_argument("--mode", type=str, default="short", choices=["short", "medium", "long"], help="対象モード")
+    parser.add_argument("--exclude-symbols", type=str, default="",
+                         help="統合対象から除外する銘柄(train.pyの--exclude-symbolsと合わせる。"
+                              "カンマ区切り、EXPECTED_SYMBOLSの末尾からのみ指定可能)")
     args = parser.parse_args()
+    exclude_symbols = {s.strip() for s in args.exclude_symbols.split(",") if s.strip()}
 
-    merge_portfolio_data(mode=args.mode, phase = "train")
-    merge_portfolio_data(mode=args.mode, phase = "test")
+    merge_portfolio_data(mode=args.mode, phase = "train", exclude_symbols=exclude_symbols)
+    merge_portfolio_data(mode=args.mode, phase = "test", exclude_symbols=exclude_symbols)

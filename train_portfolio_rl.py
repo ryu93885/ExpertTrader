@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import glob
 import argparse
 import torch
@@ -37,7 +38,7 @@ def setup_logger():
 
 def main():
     setup_logger()
-    logging.info("portfolio_portfolio_rl.py ver211.0")
+    logging.info("portfolio_portfolio_rl.py ver212.0")
 
     # 💡 修正: mode がCLI引数化されておらず常に"short"固定だったため、mediumモードで
     # 運用していても PortfolioFXDataset が images/{symbol}/short_MTF/ を探しに行き、
@@ -62,10 +63,28 @@ def main():
                          help="同時保有できる最大銘柄数")
     parser.add_argument("--risk-per-trade-pct", type=float, default=RISK_PER_TRADE_PCT_DEFAULT * 100.0,
                          help="1トレードあたりのリスク率(%, 口座残高に対する割合)")
+    # 💡 追加(2026-11-20): train.pyの--exclude-symbolsで学習したモデルをRL側でも使える
+    # ようにする。銘柄数が変わる(観測・行動空間の次元が変わる)ため、既存のSACモデルからの
+    # 再開はできず新規学習が必要になる点に注意(resolve_model_pathsが異なる銘柄数で保存された
+    # 既存モデルを見つけた場合は、SACWithGradClip.load()側の空間不一致チェックで明示的に
+    # エラーになる)。
+    parser.add_argument("--exclude-symbols", type=str, default="",
+                         help="強化学習の対象から除外する銘柄(カンマ区切り、末尾の銘柄のみ指定可能)")
     args = parser.parse_args()
 
     # 1. 基本設定
     symbols = ["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"]
+    exclude_symbols = {s.strip() for s in args.exclude_symbols.split(",") if s.strip()}
+    if exclude_symbols:
+        n = len(exclude_symbols)
+        if set(symbols[-n:]) != exclude_symbols:
+            logging.error(
+                f"❌ --exclude-symbolsは銘柄埋め込みIDの安全性のため、末尾の銘柄のみ除外可能です"
+                f"(順序={symbols}, 指定された除外={sorted(exclude_symbols)})"
+            )
+            sys.exit(1)
+        logging.info(f"🚫 以下の銘柄は強化学習の対象から除外します: {sorted(exclude_symbols)}")
+        symbols = [s for s in symbols if s not in exclude_symbols]
     mode = args.mode
     merged_csv = "portfolio_merged_data_train_with_preds.csv"
     img_dir = "images"
