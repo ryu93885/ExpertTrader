@@ -160,9 +160,15 @@ BEST_MODEL_RECORD_LOCAL_DIR = "saved_rl_models"
 BEST_MODEL_RECORD_DRIVE_DIR = "/content/drive/MyDrive/saved_models_rl"
 
 
-def _best_model_record_paths(mode):
+def _best_model_record_paths(mode, local_dir=None):
+    """
+    local_dirを省略した場合はBEST_MODEL_RECORD_LOCAL_DIR(Colab側の相対パス)を使う。
+    portfolio_trading_bot.py(Windows側の本番ボット)はRL_MODEL_DIRが別の場所
+    (例: "../datafetch_modeltrain/saved_rl_models")にあるため、呼び出し側で
+    明示的に指定する。
+    """
     filename = f"best_model_record_{mode}.json"
-    local_path = os.path.join(BEST_MODEL_RECORD_LOCAL_DIR, filename)
+    local_path = os.path.join(local_dir or BEST_MODEL_RECORD_LOCAL_DIR, filename)
     drive_path = os.path.join(BEST_MODEL_RECORD_DRIVE_DIR, filename)
     return local_path, drive_path
 
@@ -176,15 +182,16 @@ def compute_file_sha256(path):
     return h.hexdigest()
 
 
-def load_best_model_record(mode):
+def load_best_model_record(mode, local_dir=None):
     """
     記録されている「検証済み最良モデル」の情報を読み込む。
-    ローカルに無ければGoogle Driveからの復元を試みる。記録自体が存在しない場合はNoneを返す
+    ローカルに無ければGoogle Driveからの復元を試みる(local_dir指定時、Driveは
+    通常存在しないため実質スキップされる)。記録自体が存在しない場合はNoneを返す
     (まだ一度もsave_best_model_record/--mark-as-bestが使われていない状態)。
     """
-    local_path, drive_path = _best_model_record_paths(mode)
+    local_path, drive_path = _best_model_record_paths(mode, local_dir)
     if not os.path.exists(local_path) and os.path.exists(drive_path):
-        os.makedirs(BEST_MODEL_RECORD_LOCAL_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
         shutil.copy2(drive_path, local_path)
 
     if not os.path.exists(local_path):
@@ -197,7 +204,7 @@ def load_best_model_record(mode):
         return None
 
 
-def save_best_model_record(mode, model_path, performance_summary=None, note=""):
+def save_best_model_record(mode, model_path, performance_summary=None, note="", local_dir=None):
     """
     指定したモデルファイルを「検証済み最良モデル」として記録する(ローカル+Drive)。
     test_portfolio.pyの--mark-as-bestから、実際のバックテスト結果を確認した上で
@@ -210,8 +217,8 @@ def save_best_model_record(mode, model_path, performance_summary=None, note=""):
         "performance_summary": performance_summary or {},
         "note": note,
     }
-    local_path, drive_path = _best_model_record_paths(mode)
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    local_path, drive_path = _best_model_record_paths(mode, local_dir)
+    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
     with open(local_path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
     logging.info(f"📝 [{mode}] 検証済み最良モデルとして記録しました: {local_path}")
@@ -225,14 +232,17 @@ def save_best_model_record(mode, model_path, performance_summary=None, note=""):
     return record
 
 
-def verify_against_best_record(model_path, mode):
+def verify_against_best_record(model_path, mode, local_dir=None):
     """
     model_pathのモデルが、記録されている「検証済み最良モデル」と内容が一致するかを
     検証し、結果をログに出力する。記録がまだ無い場合はエラーにはせず、その旨を伝えるのみ。
+    local_dirは記録(best_model_record_{mode}.json)の置き場所を指定する
+    (省略時はBEST_MODEL_RECORD_LOCAL_DIR。portfolio_trading_bot.py等、Colab側と
+    異なる場所にモデルを置く場合に指定する)。
 
     戻り値: True(一致) / False(不一致) / None(記録が存在しない)
     """
-    record = load_best_model_record(mode)
+    record = load_best_model_record(mode, local_dir)
     if record is None:
         logging.info(
             f"ℹ️ [{mode}] 検証済み最良モデルの記録がまだありません"
