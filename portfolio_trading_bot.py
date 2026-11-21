@@ -34,6 +34,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 # カスタムモジュールのパス設定
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from datafetch_modeltrain.model import MultimodalFXmodel, SYMBOL_TO_ID
+from datafetch_modeltrain.rl_checkpoint_utils import verify_against_best_record
 from trade.live_datafetch import get_live_features
 
 # ディレクトリ設定
@@ -188,6 +189,14 @@ class PortfolioFXTradingBot:
         if os.path.exists(rl_model_path):
             model = SAC.load(rl_model_path, device=self.device)
             logger.info(f"✨ 強化学習(ポートフォリオ)モデルをロードしました: {rl_model_path}")
+            # 💡 追加(2026-11-21の調査で判明した問題への対応): 学習後半の不安定化で
+            # 崩れた状態のモデルが「保存時刻が最も新しい」というだけで本番に使われて
+            # しまう事故が起きないよう、test_portfolio.pyで--mark-as-bestを使って
+            # 検証済みと記録されたモデルと内容(SHA256)が一致するか照合する。
+            # 記録ファイル(best_model_record_{mode}.json)はRL_MODEL_DIR配下に
+            # 手動で配置する想定(sac_portfolio_agent_{mode}.zip等と同じ場所)。
+            # 不一致・未記録でも起動は止めない(ログで警告するのみ)。
+            verify_against_best_record(rl_model_path, self.mode, local_dir=RL_MODEL_DIR)
         else:
             logger.error(f"❌ 強化学習モデルが見つかりません: {rl_model_path}")
             sys.exit()
