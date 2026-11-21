@@ -15,7 +15,7 @@ from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv, RISK_PER_TRADE_PCT_DEFAULT
 from rl_checkpoint_utils import (
     resolve_model_paths, checkpoint_companion_path,
-    verify_against_best_record, save_best_model_record,
+    log_model_summary, save_best_model_record, get_merged_csv_date_range,
 )
 from backtest_metrics import (
     compute_performance_summary, log_performance_summary, run_backtest_episode,
@@ -207,7 +207,7 @@ def main():
     log_file_path = os.path.join(results_dir, f"test_portfolio_{args.mode}_{timestamp}.log")
     setup_logger(log_file_path)
 
-    logging.info("test_portfolio.py ver218.0")
+    logging.info("test_portfolio.py ver219.0")
     if results_dir == DRIVE_TEST_RESULTS_DIR:
         logging.info(f"Google Driveを検出。テスト結果の保存先をDriveに設定します: {results_dir}")
     else:
@@ -258,7 +258,6 @@ def main():
             )
             return
     logging.info(f"📦 使用するモデル: {model_source} ({rl_model_path})")
-    verify_against_best_record(rl_model_path, args.mode)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device:{device}")
@@ -321,6 +320,7 @@ def main():
     #SACエージェントのロード
     model = SAC.load(rl_model_path,device = device)
     logging.info("✅ SACエージェントをロードしました。")
+    log_model_summary(model, rl_model_path, args.mode)
 
 
 
@@ -414,6 +414,10 @@ def main():
                 "total_trades": summary["total_trades"],
             },
             note=f"test_portfolio.py実行時({timestamp})に--mark-as-bestで記録",
+            num_timesteps=getattr(model, "num_timesteps", None),
+            # 💡 学習時に使われたCSV(portfolio_merged_data_train_with_preds.csv)から
+            # 「どの期間のデータで学習したモデルか」を取得する(無ければNoneのまま)。
+            train_data_range=get_merged_csv_date_range(),
         )
 
     # 💡 追加(2026-11-18の改修): GOLDのような低エッジの銘柄が、ポートフォリオ全体の

@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import time
+import csv
 import logging
 import hashlib
 import json
@@ -204,11 +205,44 @@ def load_best_model_record(mode, local_dir=None):
         return None
 
 
-def save_best_model_record(mode, model_path, performance_summary=None, note="", local_dir=None):
+def get_merged_csv_date_range(csv_path="portfolio_merged_data_train_with_preds.csv"):
+    """
+    💡 追加(2026-11-21の検討): 「どの期間のデータで学習したか」を可視化するため、
+    portfolio_merged_data_*_with_preds.csvの"time"列から先頭・末尾の日時を取得する。
+    pandas等の重い依存を避けるため、csvモジュールで該当列だけを読む
+    (このファイル自体はtorch/pandas非依存のまま保つ)。取得できない場合は
+    Noneを返す(呼び出し元で必須にはしない)。
+    """
+    if not os.path.exists(csv_path):
+        return None
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            time_idx = header.index("time")
+            first_time, last_time = None, None
+            for row in reader:
+                if not row:
+                    continue
+                if first_time is None:
+                    first_time = row[time_idx]
+                last_time = row[time_idx]
+        if first_time is None:
+            return None
+        return {"start": first_time, "end": last_time}
+    except Exception as e:
+        logging.warning(f"⚠️ {csv_path}の学習データ期間の取得に失敗しました: {e}")
+        return None
+
+
+def save_best_model_record(mode, model_path, performance_summary=None, note="", local_dir=None,
+                            num_timesteps=None, train_data_range=None):
     """
     指定したモデルファイルを「検証済み最良モデル」として記録する(ローカル+Drive)。
     test_portfolio.pyの--mark-as-bestから、実際のバックテスト結果を確認した上で
     呼ばれることを想定している(自動では呼ばれない)。
+    num_timesteps/train_data_rangeは、手動コピー運用でも「いつ・どの期間のデータで・
+    何ステップ学習したものか」を後から確認できるようにするための追加情報(任意)。
     """
     record = {
         "sha256": compute_file_sha256(model_path),
@@ -217,6 +251,10 @@ def save_best_model_record(mode, model_path, performance_summary=None, note="", 
         "performance_summary": performance_summary or {},
         "note": note,
     }
+    if num_timesteps is not None:
+        record["num_timesteps"] = int(num_timesteps)
+    if train_data_range is not None:
+        record["train_data_range"] = train_data_range
     local_path, drive_path = _best_model_record_paths(mode, local_dir)
     os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
     with open(local_path, "w", encoding="utf-8") as f:
@@ -264,3 +302,42 @@ def verify_against_best_record(model_path, mode, local_dir=None):
     if perf:
         logging.warning(f"   記録されている最良モデルの成績: {perf}")
     return False
+
+
+def log_model_summary(model, model_path, mode, local_dir=None):
+    """
+    💡 追加(2026-11-21の検討への対応): 手動コピー運用では、使おうとしているモデルが
+    本当に意図したもの(いつ・どのステップ数まで・どの期間のデータで学習したか)を
+    目視で確認しづらいという課題があったため、モデルを使用する直前にその来歴を
+    まとめて表示する。verify_against_best_record(ハッシュの一致判定)に加えて、
+    モデル自身が持つ情報(num_timesteps)・記録済みの最良モデル情報(学習ステップ数・
+    学習データ期間・バックテスト成績)を合わせて表示する。
+    """
+    logging.info("=" * 60)
+    logging.info(f"📦 [{mode}] 使用するモデルの情報")
+    logging.info("=" * 60)
+    logging.info(f"ファイル: {model_path}")
+    if os.path.exists(model_path):
+        mtime_str = datetime.fromtimestamp(os.path.getmtime(model_path)).isoformat(timespec="seconds")
+        logging.info(
+            f"ファイルの更新日時(mtime): {mtime_str}"
+            "(コピー方法によっては元の保存日時がそのまま引き継がれている場合があります)"
+        )
+    if hasattr(model, "num_timesteps"):
+        logging.info(f"このモデル自体が記憶している学習ステップ数(num_timesteps): {model.num_timesteps:,}")
+
+    match = verify_against_best_record(model_path, mode, local_dir)
+
+    record = load_best_model_record(mode, local_dir)
+    if record is not None:
+        logging.info(f"--- 記録されている検証済み最良モデルの情報(記録日時={record.get('marked_at')}) ---")
+        if "num_timesteps" in record:
+            logging.info(f"    学習ステップ数: {record['num_timesteps']:,}")
+        train_range = record.get("train_data_range")
+        if train_range:
+            logging.info(f"    学習データ期間: {train_range.get('start')} 〜 {train_range.get('end')}")
+        perf = record.get("performance_summary")
+        if perf:
+            logging.info(f"    記録時のバックテスト成績: {perf}")
+    logging.info("=" * 60)
+    return match
