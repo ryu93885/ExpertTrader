@@ -14,7 +14,7 @@ from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv, RISK_PER_TRADE_PCT_DEFAULT
 from model import MultimodalFXmodel  # 既存のアナライザモデル
 from sac_grad_clip import SACWithGradClip
-from rl_checkpoint_utils import get_checkpoint_dirs,resolve_model_paths
+from rl_checkpoint_utils import get_checkpoint_dirs, resolve_model_paths, verify_against_best_record
 
 # 💡 学習率スケジュール: 固定値をトライ&エラーで探すのではなく、学習が進むにつれて
 # 自動的に更新幅を小さくしていく(SB3標準のLinearSchedule)。80万ステップ付近で
@@ -38,7 +38,7 @@ def setup_logger():
 
 def main():
     setup_logger()
-    logging.info("portfolio_portfolio_rl.py ver213.0")
+    logging.info("portfolio_portfolio_rl.py ver214.0")
 
     # 💡 修正: mode がCLI引数化されておらず常に"short"固定だったため、mediumモードで
     # 運用していても PortfolioFXDataset が images/{symbol}/short_MTF/ を探しに行き、
@@ -150,6 +150,10 @@ def main():
 
     if resumed_model_path is not None:
         logging.info(f"既存のモデルを検出しました({model_source}): {resumed_model_path}")
+        # 💡 追加(2026-11-21の調査で判明した問題への対応): 「保存時刻が最も新しいモデル」が
+        # 実は学習後半で崩れた状態である事例が発生した。意図せず検証済み最良モデルと異なる
+        # 状態から再開しないよう、継続学習の起点としてこれを使う前に照合する。
+        verify_against_best_record(resumed_model_path, mode)
         vec_env = VecNormalize.load(resumed_vecnorm_path, vec_env)
         vec_env.training = True
         vec_env.norm_reward = True

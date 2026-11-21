@@ -13,7 +13,10 @@ from stable_baselines3.common.vec_env import DummyVecEnv,VecNormalize
 
 from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv, RISK_PER_TRADE_PCT_DEFAULT
-from rl_checkpoint_utils import resolve_model_paths, checkpoint_companion_path
+from rl_checkpoint_utils import (
+    resolve_model_paths, checkpoint_companion_path,
+    verify_against_best_record, save_best_model_record,
+)
 from backtest_metrics import (
     compute_performance_summary, log_performance_summary, run_backtest_episode,
     analyze_symbol_contribution, log_symbol_contribution_analysis,
@@ -186,6 +189,15 @@ def main():
                          help="--model-path指定時に対応するVecNormalize統計(.pkl)。省略時は"
                               "CheckpointCallbackの命名規則(..._vecnormalize_{steps}_steps.pkl)"
                               "から自動推定する")
+    # 💡 追加(2026-11-21の調査で判明した問題への対応): 「保存時刻が最も新しいモデル」が
+    # 実は学習後半で崩れた状態である事例が発生した。今回のバックテスト結果を確認した上で、
+    # このモデルを「検証済み最良モデル」として明示的に記録できるようにする
+    # (train_portfolio_rl.py・sweep_entry_threshold.py側では、この記録と実際に使われている
+    # モデルが一致するかを照合する)。
+    parser.add_argument("--mark-as-best", action="store_true",
+                         help="このバックテストで使用したモデルを、検証済み最良モデルとして記録する"
+                              "(SHA256ハッシュ+今回の成績summaryをsaved_rl_models/"
+                              "best_model_record_{mode}.jsonに保存)")
     args = parser.parse_args()
 
     # 💡 追加: ログファイル・グラフの保存先を先に決定してからロガーを初期化することで、
@@ -195,7 +207,7 @@ def main():
     log_file_path = os.path.join(results_dir, f"test_portfolio_{args.mode}_{timestamp}.log")
     setup_logger(log_file_path)
 
-    logging.info("test_portfolio.py ver217.0")
+    logging.info("test_portfolio.py ver218.0")
     if results_dir == DRIVE_TEST_RESULTS_DIR:
         logging.info(f"Google Driveを検出。テスト結果の保存先をDriveに設定します: {results_dir}")
     else:
@@ -246,6 +258,7 @@ def main():
             )
             return
     logging.info(f"📦 使用するモデル: {model_source} ({rl_model_path})")
+    verify_against_best_record(rl_model_path, args.mode)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device:{device}")
@@ -389,6 +402,19 @@ def main():
 
     summary = compute_performance_summary(equities, balances, trades, initial_balance, elapsed_days)
     log_performance_summary(summary)
+
+    if args.mark_as_best:
+        save_best_model_record(
+            args.mode, rl_model_path,
+            performance_summary={
+                "total_return_pct": summary["total_return_pct"],
+                "max_drawdown_pct": summary["max_drawdown_pct"],
+                "win_rate_pct": summary["win_rate_pct"],
+                "profit_factor": summary["profit_factor"],
+                "total_trades": summary["total_trades"],
+            },
+            note=f"test_portfolio.py実行時({timestamp})に--mark-as-bestで記録",
+        )
 
     # 💡 追加(2026-11-18の改修): GOLDのような低エッジの銘柄が、ポートフォリオ全体の
     # リスク低減(分散効果)に寄与していないかを、再学習なしで確認できるようにする。

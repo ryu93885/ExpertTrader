@@ -49,7 +49,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv, RISK_PER_TRADE_PCT_DEFAULT
-from rl_checkpoint_utils import resolve_model_paths
+from rl_checkpoint_utils import resolve_model_paths, verify_against_best_record
 from backtest_metrics import compute_performance_summary, run_backtest_episode
 
 DRIVE_TEST_RESULTS_DIR = "/content/drive/MyDrive/FX_AI_Models/test_results"
@@ -106,7 +106,7 @@ def run_one_combo(dataset, symbols, vec_norm_path, model, window, percentile, ma
 
 def main():
     setup_logger()
-    logging.info("sweep_entry_threshold.py ver3.0")
+    logging.info("sweep_entry_threshold.py ver4.0")
 
     parser = argparse.ArgumentParser(description="動的エントリー閾値・同時保有上限のパラメータ探稢(再学習なし)")
     parser.add_argument("--symbols", default=["GBPUSD", "EURUSD", "USDJPY", "AUDUSD", "GBPJPY", "EURJPY", "GOLD"])
@@ -150,6 +150,10 @@ def main():
         logging.error("❌ SACモデルが見つかりません。学習が完了しているか確認してください。")
         return
     logging.info(f"📦 使用するモデル: {model_source} ({rl_model_path})")
+    # 💡 追加(2026-11-21の調査で判明した問題への対応): 「保存時刻が最も新しいモデル」が
+    # 実は学習後半で崩れた状態である事例が発生した。崩れたモデルに対して探索しても
+    # 結果が無意味になるため、検証済み最良モデルと一致するか照合する。
+    verify_against_best_record(rl_model_path, args.mode)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("テスト用データセットを読み込んでいます....")

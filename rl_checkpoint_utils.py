@@ -3,6 +3,10 @@ import re
 import glob
 import time
 import logging
+import hashlib
+import json
+import shutil
+from datetime import datetime
 
 # 💡 train_portfolio_rl.py / test_portfolio.py の両方で、ポートフォリオRLモデルの
 # 保存場所の解決ロジックを共有するためのユーティリティ。
@@ -141,3 +145,112 @@ def resolve_model_paths(mode):
         )
 
     return model_path, vecnorm_path, replay_path, description
+
+
+# 💡 追加(2026-11-21の調査で判明した問題への対応): 2026-11-20の学習で、学習完了後の
+# 「完了済みモデル」が実は学習後半の不安定化で崩れた状態であり、2,500,000ステップ時点の
+# チェックポイントの方が実バックテストで明確に良い成績(総合収益率+5.29%・最大DD12.41%)
+# だったことが判明した。resolve_model_paths()は「保存時刻が最も新しいもの」を機械的に
+# 選ぶだけで、「それが実際に検証済みの良いモデルか」までは判断できない。
+# 今後、保存時刻の新しいチェックポイント・完了済みモデルに気づかず切り替わってしまう
+# ことを防ぐため、「検証の結果これが最良である」と明示的に記録したモデルのSHA256ハッシュと
+# 照合する仕組みを追加する。ファイル名やmtimeではなく中身のハッシュで比較するため、
+# コピー・リネームされても正しく同一性を判定できる。
+BEST_MODEL_RECORD_LOCAL_DIR = "saved_rl_models"
+BEST_MODEL_RECORD_DRIVE_DIR = "/content/drive/MyDrive/saved_models_rl"
+
+
+def _best_model_record_paths(mode):
+    filename = f"best_model_record_{mode}.json"
+    local_path = os.path.join(BEST_MODEL_RECORD_LOCAL_DIR, filename)
+    drive_path = os.path.join(BEST_MODEL_RECORD_DRIVE_DIR, filename)
+    return local_path, drive_path
+
+
+def compute_file_sha256(path):
+    """モデルファイル(.zip)の内容からSHA256ハッシュを計算する。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_best_model_record(mode):
+    """
+    記録されている「検証済み最良モデル」の情報を読み込む。
+    ローカルに無ければGoogle Driveからの復元を試みる。記録自体が存在しない場合はNoneを返す
+    (まだ一度もsave_best_model_record/--mark-as-bestが使われていない状態)。
+    """
+    local_path, drive_path = _best_model_record_paths(mode)
+    if not os.path.exists(local_path) and os.path.exists(drive_path):
+        os.makedirs(BEST_MODEL_RECORD_LOCAL_DIR, exist_ok=True)
+        shutil.copy2(drive_path, local_path)
+
+    if not os.path.exists(local_path):
+        return None
+    try:
+        with open(local_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning(f"⚠️ best_model_record_{mode}.jsonの読み込みに失敗しました: {e}")
+        return None
+
+
+def save_best_model_record(mode, model_path, performance_summary=None, note=""):
+    """
+    指定したモデルファイルを「検証済み最良モデル」として記録する(ローカル+Drive)。
+    test_portfolio.pyの--mark-as-bestから、実際のバックテスト結果を確認した上で
+    呼ばれることを想定している(自動では呼ばれない)。
+    """
+    record = {
+        "sha256": compute_file_sha256(model_path),
+        "model_filename": os.path.basename(model_path),
+        "marked_at": datetime.now().isoformat(timespec="seconds"),
+        "performance_summary": performance_summary or {},
+        "note": note,
+    }
+    local_path, drive_path = _best_model_record_paths(mode)
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    with open(local_path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+    logging.info(f"📝 [{mode}] 検証済み最良モデルとして記録しました: {local_path}")
+
+    if os.path.exists("/content/drive/MyDrive"):
+        try:
+            os.makedirs(os.path.dirname(drive_path), exist_ok=True)
+            shutil.copy2(local_path, drive_path)
+        except Exception as e:
+            logging.warning(f"⚠️ best_model_record_{mode}.jsonのGoogle Driveへのバックアップに失敗しました: {e}")
+    return record
+
+
+def verify_against_best_record(model_path, mode):
+    """
+    model_pathのモデルが、記録されている「検証済み最良モデル」と内容が一致するかを
+    検証し、結果をログに出力する。記録がまだ無い場合はエラーにはせず、その旨を伝えるのみ。
+
+    戻り値: True(一致) / False(不一致) / None(記録が存在しない)
+    """
+    record = load_best_model_record(mode)
+    if record is None:
+        logging.info(
+            f"ℹ️ [{mode}] 検証済み最良モデルの記録がまだありません"
+            "(test_portfolio.pyで--mark-as-bestを使うと記録できます)。"
+        )
+        return None
+
+    current_hash = compute_file_sha256(model_path)
+    if current_hash == record.get("sha256"):
+        logging.info(f"✅ [{mode}] 使用するモデルは、記録されている検証済み最良モデルと一致しています。")
+        return True
+
+    logging.warning(
+        f"⚠️ [{mode}] 使用しようとしているモデル({os.path.basename(model_path)})は、"
+        f"記録されている検証済み最良モデル({record.get('model_filename')}、"
+        f"記録日時={record.get('marked_at')})と一致しません。意図した状態か確認してください。"
+    )
+    perf = record.get("performance_summary")
+    if perf:
+        logging.warning(f"   記録されている最良モデルの成績: {perf}")
+    return False
