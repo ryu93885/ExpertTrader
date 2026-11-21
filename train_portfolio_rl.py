@@ -38,7 +38,7 @@ def setup_logger():
 
 def main():
     setup_logger()
-    logging.info("portfolio_portfolio_rl.py ver212.0")
+    logging.info("portfolio_portfolio_rl.py ver213.0")
 
     # 💡 修正: mode がCLI引数化されておらず常に"short"固定だったため、mediumモードで
     # 運用していても PortfolioFXDataset が images/{symbol}/short_MTF/ を探しに行き、
@@ -171,6 +171,13 @@ def main():
             tensorboard_log="./sac_portfolio_tensorboard/",
             learning_rate=lr_schedule,
         )
+
+    # 💡 追加(2026-11-21の調査で判明した問題への対応): critic_loss急上昇検知時に
+    # 保存する「安定していた状態のスナップショット」の保存先を、モード別のパスに
+    # 揃える(詳細はsac_grad_clip.py参照)。新規・再開のどちらの場合にも適用する。
+    model.safe_snapshot_path_base = f"saved_rl_models/sac_portfolio_agent_{mode}_safe_snapshot"
+    model.drive_safe_snapshot_dir = "/content/drive/MyDrive/saved_models_rl"
+
     checkpoint_callback = CheckpointCallback(
         save_freq=CHECKPOINT_SAVE_FREQ,
         save_path=checkpoint_save_dir,
