@@ -13,7 +13,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv,VecNormalize
 
 from portfolio_dataset import PortfolioFXDataset
 from portfolio_env import PortfolioFXEnv, RISK_PER_TRADE_PCT_DEFAULT
-from rl_checkpoint_utils import resolve_model_paths
+from rl_checkpoint_utils import resolve_model_paths, checkpoint_companion_path
 from backtest_metrics import (
     compute_performance_summary, log_performance_summary, run_backtest_episode,
     analyze_symbol_contribution, log_symbol_contribution_analysis,
@@ -172,6 +172,20 @@ def main():
     # 一貫して扱えるようにする(--symbolsを直接書き換える代わりに、末尾から除外する形で指定)。
     parser.add_argument("--exclude-symbols", type=str, default="",
                          help="バックテスト対象から除外する銘柄(カンマ区切り、--symbolsの末尾のみ指定可能)")
+    # 💡 追加(2026-11-21の検証で判明した問題への対応): critic_lossが学習後半で
+    # 悪化した状態の完了済みモデルをそのまま検証するのではなく、途中保存の
+    # チェックポイント(CheckpointCallbackがCHECKPOINT_SAVE_FREQごとに保存したもの)を
+    # 明示的に指定して検証できるようにする。省略時は従来通りresolve_model_paths()が
+    # 保存時刻の最も新しいものを自動選択する(挙動は変わらない)。
+    parser.add_argument("--model-path", type=str, default=None,
+                         help="検証する具体的なモデルファイル(.zip)。省略時は保存時刻が最も"
+                              "新しいものを自動選択する(従来通り)。学習途中のチェックポイント等、"
+                              "特定の時点のモデルを検証したい場合に指定する"
+                              "(例: saved_rl_models/checkpoints/sac_portfolio_agent_medium_2500000_steps.zip)")
+    parser.add_argument("--vecnorm-path", type=str, default=None,
+                         help="--model-path指定時に対応するVecNormalize統計(.pkl)。省略時は"
+                              "CheckpointCallbackの命名規則(..._vecnormalize_{steps}_steps.pkl)"
+                              "から自動推定する")
     args = parser.parse_args()
 
     # 💡 追加: ログファイル・グラフの保存先を先に決定してからロガーを初期化することで、
@@ -181,7 +195,7 @@ def main():
     log_file_path = os.path.join(results_dir, f"test_portfolio_{args.mode}_{timestamp}.log")
     setup_logger(log_file_path)
 
-    logging.info("test_portfolio.py ver216.0")
+    logging.info("test_portfolio.py ver217.0")
     if results_dir == DRIVE_TEST_RESULTS_DIR:
         logging.info(f"Google Driveを検出。テスト結果の保存先をDriveに設定します: {results_dir}")
     else:
@@ -199,13 +213,38 @@ def main():
     test_csv = "portfolio_merged_data_test_with_preds.csv"
     img_dir = "images"
 
-    rl_model_path, vec_norm_path, _replay_buffer_path, model_source = resolve_model_paths(args.mode)
-    if rl_model_path is None:
-        logging.error(
-            "❌ SACモデルが見つかりません(完了済みモデル・Drive上のコピー・"
-            "途中保存のいずれも見つかりませんでした)。学習が完了しているか確認してください。"
-        )
-        return
+    if args.model_path:
+        rl_model_path = args.model_path
+        if not os.path.exists(rl_model_path):
+            logging.error(f"❌ 指定されたモデルファイルが見つかりません: {rl_model_path}")
+            return
+        if args.vecnorm_path:
+            vec_norm_path = args.vecnorm_path
+        else:
+            try:
+                vec_norm_path = checkpoint_companion_path(rl_model_path, "vecnormalize_")
+            except AttributeError:
+                logging.error(
+                    f"❌ {rl_model_path} のファイル名がチェックポイントの命名規則"
+                    "({prefix}_{steps}_steps.zip)と一致しないため、対応するVecNormalize統計を"
+                    "自動推定できません。--vecnorm-pathで明示的に指定してください。"
+                )
+                return
+        if not os.path.exists(vec_norm_path):
+            logging.error(
+                f"❌ 対応するVecNormalize統計ファイルが見つかりません: {vec_norm_path}"
+                f"(--vecnorm-pathで明示的に指定することもできます)"
+            )
+            return
+        model_source = f"手動指定: {rl_model_path}"
+    else:
+        rl_model_path, vec_norm_path, _replay_buffer_path, model_source = resolve_model_paths(args.mode)
+        if rl_model_path is None:
+            logging.error(
+                "❌ SACモデルが見つかりません(完了済みモデル・Drive上のコピー・"
+                "途中保存のいずれも見つかりませんでした)。学習が完了しているか確認してください。"
+            )
+            return
     logging.info(f"📦 使用するモデル: {model_source} ({rl_model_path})")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
