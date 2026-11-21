@@ -1,0 +1,26 @@
+# datafetch_modeltrain の再学習(merge_portfolio_data.py / precompute_portfolio.py /
+# train_portfolio_rl.py 等)に必要なPythonパッケージ一覧。
+#
+# 注意: MetaTrader5 パッケージは含めていません。Windows専用でLinux(Codespaces)には
+# インストールできず、また今回のポートフォリオRL再学習フロー自体はMT5への
+# 接続を必要としないためです(fetch_data.py / live_datafetch.py / portfolio_trading_bot.py
+# など、実際にMT5へ接続するスクリプトを動かす場合はWindows環境が別途必要です)。
+
+pandas
+numpy
+Pillow
+torch
+torchvision
+gymnasium
+# 💡 sac_grad_clip.py の SACWithGradClip は SAC.train() の内部ロジックを
+# 忠実に複製した上で勾配クリッピングを追加したサブクラスであるため、
+# stable-baselines3 のバージョンを固定している。バージョンを上げる場合は
+# sac_grad_clip.py を新しい SAC.train() の実装に追従させてから変更すること。
+stable-baselines3==2.9.0
+optuna
+mplfinance
+matplotlib
+scikit-learn
+joblib
+scipy
+tqdm
