@@ -57,6 +57,21 @@ CIRCUIT_BREAKER_THRESHOLD = 3.0
 
 MAX_LOT_SIZE = 5.0  # portfolio_env.py の学習時ロジックと一致させるロット数の絶対上限
 
+# 💡 追加(2026-11-24の検証への対応): 2026-11-24、balance100万円に対してGOLD 1.8ロット
+# (想定の数十倍規模)のエントリーが発生した。主要因・安全弁(_send_orderの
+# absolute_safety_cap)のどちらも symbol_info.trade_tick_value/trade_tick_size を
+# 使った同じ計算式に依存しているため、この値がATRの異常値(データ不足・瞬間的な
+# 異常値等)やブローカー側のシンボル仕様の取得不良で誤っていた場合、安全弁も
+# 同時に無効化されてしまう構造的弱点があった。
+# そのため、ATR/SL距離/tick_value を一切使わない、独立した計算経路での
+# 最終防衛ラインを追加する。mt5.order_calc_margin()(ブローカー側の証拠金計算
+# エンジン。tick_value/tick_sizeとは別のMT5サブシステムで、通貨換算も内部で
+# 正しく行われる)で実際に必要な証拠金を取得し、資産(equity)に対する比率で
+# 直接上限をかける。ATR計算・tick_value取得のどちらが誤っていても、この
+# チェックは独立して機能する。0.3(30%)は、通常のリスクベースのロット計算では
+# まず到達しないはずの、あくまで異常値用の最終防衛ライン。
+MAX_MARGIN_TO_EQUITY_RATIO = 0.3
+
 # 💡 修正(2026-11-06): sweep_entry_threshold.py / test_portfolio.py による検証の結果、
 # window=500, percentile=50, max_concurrent_positions=5, risk_per_trade_pct=7% が
 # これまで検証した中で最も再現性の高い(期間を分割しても一貫してプラスを維持する)
@@ -88,6 +103,9 @@ DECISION_LOG_HEADERS = [
     "act_direction", "act_tp", "act_sl",
     "decision", "lot_size", "sl_dist", "tp_dist", "order_retcode",
     "equity", "balance",
+    # 💡 追加(2026-11-24の検証への対応): GOLDで想定外に大きいロットが送られた事故の
+    # 原因調査用。ロット計算の中間値をすべて残し、再発時に即座に原因を特定できるようにする。
+    "atr", "risk_amount", "trade_tick_value", "trade_tick_size", "raw_lot_before_cap",
 ]
 TRADE_LOG_HEADERS = ["timestamp", "symbol", "profit", "volume", "price", "outcome"]
 
@@ -503,6 +521,8 @@ class PortfolioFXTradingBot:
                 "act_direction": act_direction, "act_tp": act_tp, "act_sl": act_sl,
                 "decision": "", "lot_size": "", "sl_dist": "", "tp_dist": "", "order_retcode": "",
                 "equity": equity, "balance": balance,
+                "atr": "", "risk_amount": "", "trade_tick_value": "", "trade_tick_size": "",
+                "raw_lot_before_cap": "",
             }
 
             # 💡 追加(2026-11-06): portfolio_env.py の step() と同じく、ポジションの
@@ -555,6 +575,14 @@ class PortfolioFXTradingBot:
             current_close = raw_dfs[sym][f"{base_tf}_close"].iloc[-1]
             atr = raw_dfs[sym].get(f"{tf}_ATR", current_close * 0.005)
             if isinstance(atr, pd.Series): atr = atr.iloc[-1]
+            # 💡 追加(2026-11-24の検証への対応): 列自体は存在していても、起動直後で
+            # rolling(window=14)に必要な本数がまだ溜まっていない場合、最後の値がNaNの
+            # ままここまで来てしまう(.get()の既定値は列が丸ごと無い場合にしか効かない)。
+            # NaNのままsl_dist以降の計算に伝播すると、ロットサイズ計算が未定義動作に
+            # なりかねないため、ここで明示的にフォールバックする。
+            if pd.isna(atr):
+                atr = current_close * 0.005
+                logger.warning(f"⚠️ [{sym}] ATRがNaNのため、フォールバック値({atr:.5f})を使用します。")
 
             # Envと完全に一致したTP/SL距離の計算
             sl_dist = atr * (1.0 + (act_sl + 1.0))
@@ -573,17 +601,23 @@ class PortfolioFXTradingBot:
                 loss_per_price_unit = symbol_info.trade_tick_value / symbol_info.trade_tick_size
                 loss_for_this_trade = sl_dist * loss_per_price_unit
                 raw_lot = risk_amount / max(loss_for_this_trade, 1e-5)
+                log_row["raw_lot_before_cap"] = raw_lot
                 raw_lot = min(raw_lot, MAX_LOT_SIZE)
 
                 step = symbol_info.volume_step
                 target_pos = round(raw_lot / step) * step
                 target_pos = max(symbol_info.volume_min, min(target_pos, symbol_info.volume_max))
+
+                log_row["trade_tick_value"] = symbol_info.trade_tick_value
+                log_row["trade_tick_size"] = symbol_info.trade_tick_size
             else:
                 target_pos = 0.01
 
             log_row["lot_size"] = target_pos
             log_row["sl_dist"] = sl_dist
             log_row["tp_dist"] = tp_dist
+            log_row["atr"] = atr
+            log_row["risk_amount"] = risk_amount
 
             if direction_sign > 0:
                 retcode = self._send_order(sym, mt5.ORDER_TYPE_BUY, target_pos, tp_dist, sl_dist)
@@ -609,6 +643,10 @@ class PortfolioFXTradingBot:
 
 
         account = mt5.account_info()
+        # 💡 移動(2026-11-24): 下の独立防衛フィルターでも価格(price)が必要なため、
+        # 従来ここより後ろにあったtick取得を先に行う(挙動は変わらない)。
+        tick = mt5.symbol_info_tick(symbol)
+        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
         if account is not None:
             equity = account.equity
             symbol_info_cap = mt5.symbol_info(symbol)
@@ -638,8 +676,28 @@ class PortfolioFXTradingBot:
                 logger.warning(f"⚠️ [{symbol}] 防衛フィルター作動: AIの要求ロットを {absolute_safety_cap:.2f} Lot に制限。")
                 lots = absolute_safety_cap
 
-        tick = mt5.symbol_info_tick(symbol)
-        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+            # 💡 追加(2026-11-24の検証への対応): 上の防衛フィルターはtrade_tick_value/
+            # trade_tick_sizeを使った計算式を共有しているため、この値自体が異常・誤りで
+            # あった場合は防衛フィルターも同時に無効化されてしまう(2026-11-24のGOLD
+            # 1.8ロット事故で確認された構造的弱点)。mt5.order_calc_margin()はtick_value/
+            # tick_sizeとは別のMT5サブシステム(証拠金計算エンジン)で、通貨換算も内部で
+            # 行われるため、account.equityと単位が揃った値を自前の為替換算なしで取得できる。
+            try:
+                required_margin = mt5.order_calc_margin(order_type, symbol, lots, price)
+            except Exception as e:
+                required_margin = None
+                logger.warning(f"⚠️ [{symbol}] order_calc_marginの呼び出しに失敗しました: {e}")
+
+            if required_margin is not None:
+                max_margin = equity * MAX_MARGIN_TO_EQUITY_RATIO
+                if required_margin > max_margin and required_margin > 0:
+                    capped_lots = max(0.01, round(lots * (max_margin / required_margin), 2))
+                    logger.warning(
+                        f"⚠️ [{symbol}] 独立防衛フィルター作動: 必要証拠金({required_margin:,.0f})が"
+                        f"資産の{MAX_MARGIN_TO_EQUITY_RATIO:.0%}({max_margin:,.0f})を超えるため、"
+                        f"ロットを{lots:.2f}から{capped_lots:.2f}に制限します。"
+                    )
+                    lots = capped_lots
         
         tp_price = price + tp_dist if order_type == mt5.ORDER_TYPE_BUY else price - tp_dist
         sl_price = price - sl_dist if order_type == mt5.ORDER_TYPE_BUY else price + sl_dist
