@@ -72,6 +72,83 @@ MAX_LOT_SIZE = 5.0  # portfolio_env.py の学習時ロジックと一致させ�
 # まず到達しないはずの、あくまで異常値用の最終防衛ライン。
 MAX_MARGIN_TO_EQUITY_RATIO = 0.3
 
+# 💡 追加(2026-11-25の要望への対応): ブローカーを乗り換えると、同じ銘柄でも表記が
+# 異なる場合がある(例: GOLD→XAUUSD、USDJPY→USDJPYz等、"z"はゼロ口座用の別シンボル)。
+# TARGET_SYMBOLS(学習・モデル側の固定名=カノニカル名)はそのままに、実際にMT5へ
+# 送る銘柄名だけを自動解決する(resolve_broker_symbols参照)。
+#
+# GOLDのように、カノニカル名とブローカー側表記がまったく違う(前方一致で見つからない)
+# 場合だけここにエイリアスを追加する。USDJPY等は辞書に無くてもカノニカル名自体を
+# 接頭辞として自動的に使う(resolve_broker_symbols参照)ため、ここに列挙する必要はない。
+SYMBOL_ALIASES = {
+    "GOLD": ["XAUUSD", "GOLD"],
+}
+
+# 💡 自動検索が誤った銘柄を選んでしまう場合の手動上書き用(通常は空のままでよい)。
+# 例: SYMBOL_OVERRIDE_MAP = {"GOLD": "XAUUSD.raw"}
+SYMBOL_OVERRIDE_MAP = {}
+
+
+def resolve_broker_symbols(canonical_symbols):
+    """
+    接続中のMT5サーバーの実際の銘柄一覧(mt5.symbols_get())から、カノニカル名
+    (TARGET_SYMBOLS。学習・モデル側で使う固定の名前)に対応する実際のブローカー側
+    銘柄名を自動検索する。戻り値は {カノニカル名: ブローカー側名} の辞書。
+
+    検索順位:
+      1. SYMBOL_OVERRIDE_MAP(手動指定。最優先)
+      2. 完全一致(カノニカル名がそのまま存在する)
+      3. エイリアス・前方一致(SYMBOL_ALIASESに無ければカノニカル名自体を接頭辞として使う)。
+         複数候補がある場合、"z"(ゼロ口座)で終わるものは優先度を下げ(要望通り標準口座を
+         優先)、残りの中から最も短い(カノニカル名に近い)ものを選ぶ。
+
+    1つでも解決できない銘柄があれば例外を送出する(気づかないまま稼働するのを防ぐため)。
+    """
+    all_symbols = mt5.symbols_get()
+    if not all_symbols:
+        raise RuntimeError("MT5から銘柄一覧を取得できませんでした(symbols_get()が空です)。")
+    available_names = {s.name for s in all_symbols}
+
+    resolved = {}
+    unresolved = []
+    for canonical in canonical_symbols:
+        override = SYMBOL_OVERRIDE_MAP.get(canonical)
+        if override:
+            if override in available_names:
+                resolved[canonical] = override
+                logger.info(f"🔧 [{canonical}] SYMBOL_OVERRIDE_MAPの指定を使用します: {override}")
+                continue
+            logger.warning(
+                f"⚠️ [{canonical}] SYMBOL_OVERRIDE_MAPで指定された{override}がブローカーに"
+                "見つかりません。自動検索にフォールバックします。"
+            )
+
+        if canonical in available_names:
+            resolved[canonical] = canonical
+            continue
+
+        aliases = SYMBOL_ALIASES.get(canonical, [canonical])
+        candidates = [
+            name for name in available_names
+            if any(name.upper().startswith(alias.upper()) for alias in aliases)
+        ]
+        if not candidates:
+            unresolved.append(canonical)
+            continue
+
+        candidates.sort(key=lambda n: (n.upper().endswith("Z"), len(n)))
+        resolved[canonical] = candidates[0]
+        extra = f"(他の候補: {candidates[1:]})" if len(candidates) > 1 else ""
+        logger.info(f"🔍 [{canonical}] ブローカー側の銘柄名を自動解決しました: {candidates[0]} {extra}")
+
+    if unresolved:
+        raise RuntimeError(
+            f"以下の銘柄に対応するシンボルがブローカー側に見つかりませんでした: {unresolved} "
+            "(SYMBOL_ALIASES/SYMBOL_OVERRIDE_MAPへの追加が必要な可能性があります)"
+        )
+    return resolved
+
+
 # 💡 修正(2026-11-06): sweep_entry_threshold.py / test_portfolio.py による検証の結果、
 # window=500, percentile=50, max_concurrent_positions=5, risk_per_trade_pct=7% が
 # これまで検証した中で最も再現性の高い(期間を分割しても一貫してプラスを維持する)
@@ -126,10 +203,16 @@ class DummyEnvForLoading(gym.Env):
         return np.zeros(self.observation_space.shape, dtype=np.float32), 0.0, False, False, {}
 
 class PortfolioFXTradingBot:
-    def __init__(self, symbols, mode):
+    def __init__(self, symbols, mode, broker_symbols=None):
         self.symbols = symbols
         self.num_symbols = len(symbols)
         self.mode = mode
+        # 💡 追加(2026-11-25): {カノニカル名: ブローカー側の実際の銘柄名}。
+        # self.symbols(カノニカル名)はモデル・ログ・SYMBOL_TO_ID等の唯一の
+        # 識別子として従来通り使い、MT5へのAPI呼び出しだけこちらに変換する
+        # (resolve_broker_symbols参照)。未指定時はカノニカル名をそのまま使う
+        # (ブローカー側の表記が完全一致する場合の後方互換)。
+        self.broker_symbol = broker_symbols or {sym: sym for sym in symbols}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 観測・行動空間の次元
@@ -236,7 +319,7 @@ class PortfolioFXTradingBot:
         return model
 
     def _get_current_position(self, symbol):
-        positions = mt5.positions_get(symbol=symbol)
+        positions = mt5.positions_get(symbol=self.broker_symbol.get(symbol, symbol))
         if positions is None or len(positions) == 0:
             return 0.0
         
@@ -250,7 +333,7 @@ class PortfolioFXTradingBot:
         return total_lots
 
     def _get_unrealized_pnl_ratio(self, symbol, balance):
-        positions = mt5.positions_get(symbol=symbol)
+        positions = mt5.positions_get(symbol=self.broker_symbol.get(symbol, symbol))
         if positions is None or len(positions) == 0:
             return 0.0
         total_profit = sum(p.profit for p in positions if p.magic == MAGIC_NUMBER)
@@ -315,7 +398,7 @@ class PortfolioFXTradingBot:
 
             if prev_pos != 0.0 and current_pos == 0.0:
                 try:
-                    deals = mt5.history_deals_get(lookback_start, now, group=sym)
+                    deals = mt5.history_deals_get(lookback_start, now, group=self.broker_symbol.get(sym, sym))
                 except Exception as e:
                     deals = None
                     logger.warning(f"⚠️ [{sym}] 約定履歴の取得に失敗しました: {e}")
@@ -353,7 +436,7 @@ class PortfolioFXTradingBot:
         ])
 
         for sym in self.symbols:
-            live_data = get_live_features(sym, self.mode)
+            live_data = get_live_features(self.broker_symbol.get(sym, sym), self.mode)
             if live_data is None:
                 logger.warning(f"⚠️ {sym} のデータ取得失敗。観測生成をスキップします。")
                 return None, None, None
@@ -596,7 +679,7 @@ class PortfolioFXTradingBot:
             # Envと完全に一致した動的ロット計算（リスクRISK_PER_TRADE_PCTベース）
             risk_amount = equity * RISK_PER_TRADE_PCT * abs(act_direction)
 
-            symbol_info = mt5.symbol_info(sym)
+            symbol_info = mt5.symbol_info(self.broker_symbol.get(sym, sym))
             if symbol_info and symbol_info.trade_tick_size > 0:
                 loss_per_price_unit = symbol_info.trade_tick_value / symbol_info.trade_tick_size
                 loss_for_this_trade = sl_dist * loss_per_price_unit
@@ -641,6 +724,10 @@ class PortfolioFXTradingBot:
     def _send_order(self, symbol, order_type, lots, tp_dist, sl_dist):
         if lots < 0.01: return None
 
+        # 💡 追加(2026-11-25): 呼び出し元はカノニカル名(例: "GOLD")を渡すため、
+        # MT5への問い合わせ・発注はすべてここで一度だけブローカー側の実際の銘柄名に
+        # 変換する(以降、このメソッド内のsymbolは常にブローカー側名として扱われる)。
+        symbol = self.broker_symbol.get(symbol, symbol)
 
         account = mt5.account_info()
         # 💡 移動(2026-11-24): 下の独立防衛フィルターでも価格(price)が必要なため、
@@ -857,10 +944,22 @@ def main():
                 time.sleep(60)
                 continue
 
+            # 💡 追加(2026-11-25の要望への対応): ブローカーを乗り換えると銘柄名の表記が
+            # 異なる場合がある(GOLD→XAUUSD、USDJPY→USDJPYz等)ため、カノニカル名
+            # (TARGET_SYMBOLS)に対応する実際のブローカー側銘柄名を自動検索する。
+            try:
+                broker_symbols = resolve_broker_symbols(TARGET_SYMBOLS)
+            except Exception as e:
+                logger.error(f"❌ 銘柄名の自動解決に失敗しました。60秒後に再試行します: {e}")
+                write_heartbeat(mode, "error", "銘柄名解決失敗")
+                time.sleep(60)
+                continue
+
             symbol_select_ok = True
             for sym in TARGET_SYMBOLS:
-                if not mt5.symbol_select(sym, True):
-                    logger.error(f"❌ {sym} をMT5の気配値に追加できませんでした。60秒後に再試行します。")
+                broker_sym = broker_symbols[sym]
+                if not mt5.symbol_select(broker_sym, True):
+                    logger.error(f"❌ {sym}({broker_sym}) をMT5の気配値に追加できませんでした。60秒後に再試行します。")
                     symbol_select_ok = False
                     break
             if not symbol_select_ok:
@@ -871,9 +970,9 @@ def main():
             logger.info("⏳ MT5サーバーから過去データを同期しています。5秒お待ちください...")
             time.sleep(5)
             for sym in TARGET_SYMBOLS:
-                mt5.symbol_info_tick(sym)
+                mt5.symbol_info_tick(broker_symbols[sym])
 
-            bot = PortfolioFXTradingBot(symbols=TARGET_SYMBOLS, mode=mode)
+            bot = PortfolioFXTradingBot(symbols=TARGET_SYMBOLS, mode=mode, broker_symbols=broker_symbols)
             interval = INTERVAL_CONFIG.get(mode, 300)
 
             logger.info(f"=== 稼働開始 (更新間隔: {interval}秒) ===")
