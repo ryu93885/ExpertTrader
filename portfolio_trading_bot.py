@@ -186,6 +186,14 @@ DECISION_LOG_HEADERS = [
 ]
 TRADE_LOG_HEADERS = ["timestamp", "symbol", "profit", "volume", "price", "outcome"]
 
+# 💡 追加(2026-11-25の要望への対応): ブローカーを乗り換えても過去のテスト結果
+# (decision_log_*.csv / trade_log_*.csv / bot_*.log)は削除せず蓄積し続ける運用の
+# ため、どの行からブローカー・セッションが変わったのかを後から判別できる記録が
+# 必要。decision_log/trade_logの既存スキーマ(列構成)を変えると、既にある古い
+# ファイルの列数と食い違って壊れてしまうため、独立した専用のCSVに分離する。
+# 起動のたびに(ブローカーを変えたかどうかに関わらず)1行だけ追記する。
+SESSION_LOG_HEADERS = ["timestamp", "broker_company", "broker_server", "login", "mode", "resolved_symbols"]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -845,6 +853,47 @@ def setup_file_logging(mode):
     logger.info(f"📝 ログファイル: {log_path}")
 
 
+def write_session_log(mode, broker_symbols):
+    """
+    💡 追加(2026-11-25の要望への対応): ブローカーを乗り換えても過去のテスト結果
+    (decision_log/trade_log/bot.log)は削除せず蓄積し続けたいが、どの行から
+    ブローカー・セッションが変わったのかを後から判別できる記録が必要。
+    起動のたびに(ブローカーを変えたかどうかに関わらず)session_log_{mode}.csvに
+    1行だけ追記する(decision_log/trade_logの既存スキーマは変更しない。列数が
+    食い違って既存ファイルが壊れるのを避けるため、専用の別ファイルに分離する)。
+    """
+    path = os.path.join(LOG_DIR, f"session_log_{mode}.csv")
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=SESSION_LOG_HEADERS).writeheader()
+
+    company = server = login = None
+    try:
+        account = mt5.account_info()
+        if account is not None:
+            company, server, login = account.company, account.server, account.login
+    except Exception as e:
+        logger.warning(f"⚠️ account_infoの取得に失敗しました(セッションログ用): {e}")
+
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "broker_company": company, "broker_server": server, "login": login,
+        "mode": mode,
+        "resolved_symbols": "; ".join(f"{k}={v}" for k, v in broker_symbols.items()),
+    }
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=SESSION_LOG_HEADERS).writerow(row)
+    except Exception as e:
+        logger.error(f"⚠️ セッションログの書き込みに失敗しました ({path}): {e}")
+
+    logger.info(
+        "🆕🆕🆕 新しいセッションを開始します 🆕🆕🆕 "
+        f"ブローカー={company} / サーバー={server} / ログイン={login} / モード={mode}"
+    )
+    logger.info(f"   解決された銘柄: {row['resolved_symbols']}")
+
+
 def write_heartbeat(mode, status, detail=""):
     """
     直近サイクルの状態をJSONファイルに書き出す。外部の監視(Task Scheduler・
@@ -954,6 +1003,11 @@ def main():
                 write_heartbeat(mode, "error", "銘柄名解決失敗")
                 time.sleep(60)
                 continue
+
+            # 💡 追加(2026-11-25の要望への対応): ブローカーを変更しても過去のログは
+            # 削除しない運用のため、起動のたびにどのブローカー・サーバーに接続したかを
+            # タイムスタンプ付きで記録する(詳細はwrite_session_log参照)。
+            write_session_log(mode, broker_symbols)
 
             symbol_select_ok = True
             for sym in TARGET_SYMBOLS:
