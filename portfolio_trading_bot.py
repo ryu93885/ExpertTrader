@@ -72,6 +72,17 @@ MAX_LOT_SIZE = 5.0  # portfolio_env.py の学習時ロジックと一致させ�
 # まず到達しないはずの、あくまで異常値用の最終防衛ライン。
 MAX_MARGIN_TO_EQUITY_RATIO = 0.3
 
+# 💡 追加(2026-11-28の要望への対応): 2026-11-23のGOLD 1.8ロット事故では、balanceが
+# 一時的に負値になるまで資産が落ち込んだ(通常は想定していない事態)。個別の原因
+# (ロットサイズ・観測値の計算等)を一つずつ塞ぐアプローチに加えて、原因を問わず
+# 資産そのものが壊滅的に減少した場合に無条件でプロセスを強制終了する最終防衛ラインを
+# 設ける。基準値はボット起動(プロセス再起動)時点のbalance(self.initial_balance。
+# _build_sac_observationの観測特徴量と同じ値を共有する)とし、以後に取得した
+# balanceがその40%を下回った時点で強制終了する(sys.exit()はExceptionではなく
+# BaseExceptionのため、run_trading_loop/main()のexcept Exceptionによる自動再起動
+# ロジックには捕まらず、確実にプロセスが終了する)。
+EMERGENCY_STOP_BALANCE_RATIO = 0.4
+
 # 💡 追加(2026-11-25の要望への対応): ブローカーを乗り換えると、同じ銘柄でも表記が
 # 異なる場合がある(例: GOLD→XAUUSD、USDJPY→USDJPYz等、"z"はゼロ口座用の別シンボル)。
 # TARGET_SYMBOLS(学習・モデル側の固定名=カノニカル名)はそのままに、実際にMT5へ
@@ -561,6 +572,24 @@ class PortfolioFXTradingBot:
         return hybrid_obs_array, raw_dfs, analyst_info
 
     def execute_trade_logic(self):
+
+        # 💡 追加(2026-11-28の要望への対応): サイクルの頭で毎回balanceを確認し、
+        # 起動時点のbalance(self.initial_balance)のEMERGENCY_STOP_BALANCE_RATIO
+        # (既定40%)を下回っていたら、原因を問わず即座にプロセスを強制終了する。
+        # 個別の安全弁(absolute_safety_cap・MAX_MARGIN_TO_EQUITY_RATIO等)をすべて
+        # すり抜けた未知の不具合が今後発生しても、最終防衛ラインとして機能する。
+        account_check = mt5.account_info()
+        if account_check is not None:
+            if self.initial_balance is None:
+                self.initial_balance = account_check.balance
+            elif account_check.balance < self.initial_balance * EMERGENCY_STOP_BALANCE_RATIO:
+                logger.error(
+                    f"🚨 緊急停止: balance({account_check.balance:,.0f})が起動時のbalance"
+                    f"({self.initial_balance:,.0f})の{EMERGENCY_STOP_BALANCE_RATIO:.0%}を"
+                    "下回りました。原因調査のため、システムを強制終了します。"
+                )
+                write_heartbeat(self.mode, "error", "緊急停止: balanceが閾値を下回った")
+                sys.exit(1)
 
         # 💡 追加: VPS等の無人運用では、MT5の「アルゴリズム取引」が何らかの理由で
         # 無効化されたことに誰も気づけない。注文拒否で間接的に気づくのではなく、
